@@ -1,0 +1,73 @@
+package ui
+
+import (
+	"fmt"
+	"log"
+
+	"skinhunter/data" // Import your data package
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+)
+
+// ACTUALIZADO: NewChampionView acepta ChampionSummary, usa Alias para fetch
+func NewChampionView(champion data.ChampionSummary, onBack func(), onSkinSelect func(skin data.Skin)) fyne.CanvasObject {
+	loadingLabel := widget.NewLabel("Loading champion details...")
+	contentArea := container.NewStack(loadingLabel)
+
+	go func() {
+		// Fetch detailed data usando el Alias del ChampionSummary recibido
+		details, err := data.FetchChampionDetails(champion.Alias) // <-- Usar champion.Alias (string)
+		if err != nil {
+			log.Printf("Error fetching details for %s: %v", champion.Name, err) // Usar champion.Name para el log
+			fyne.CurrentApp().SendNotification(&fyne.Notification{
+				Title:   "Error",
+				Content: fmt.Sprintf("Could not load details for %s", champion.Name), // Usar champion.Name
+			})
+			errorLabel := widget.NewLabel(fmt.Sprintf("Error loading details for %s", champion.Name))
+			// Actualizar UI en hilo principal (implícito por Fyne para widgets)
+			contentArea.Objects = []fyne.CanvasObject{container.NewCenter(errorLabel)}
+			contentArea.Refresh()
+			return
+		}
+
+		log.Printf("Details loaded for %s, creating view...", details.Name) // Usar details.Name una vez cargado
+
+		// --- Build the Champion View UI ---
+		backButton := widget.NewButtonWithIcon("", theme.NavigateBackIcon(), onBack)
+
+		// --- Skins Grid ---
+		skinsGrid := container.NewGridWithColumns(3)
+		for _, skin := range details.Skins {
+			if skin.IsBase {
+				continue
+			}
+			selectedSkin := skin
+			item := SkinGridItem(selectedSkin, func(s data.Skin) {
+				log.Printf("Skin selected: %s (ID: %d)", s.Name, s.ID)
+				onSkinSelect(s)
+			})
+			if item != nil {
+				skinsGrid.Add(item)
+			}
+		}
+		scrollableSkins := container.NewScroll(skinsGrid)
+
+		// --- Final Layout ---
+		championViewContent := container.NewBorder(
+			container.NewHBox(backButton, widget.NewLabel(fmt.Sprintf("%s Skins", details.Name))), // Usar details.Name
+			nil, nil, nil,
+			scrollableSkins,
+		)
+
+		// Actualizar UI en hilo principal (implícito)
+		contentArea.Objects = []fyne.CanvasObject{championViewContent}
+		contentArea.Refresh()
+		log.Printf("Champion view refreshed for %s", details.Name)
+
+	}() // End of goroutine
+
+	return contentArea
+}

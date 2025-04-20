@@ -1,0 +1,1360 @@
+package main
+
+import (
+	"fmt"
+	"image"
+	"image/color"
+	_ "image/png" // Importar para decodificar PNG
+	"log"
+	"math" // Añadir importación para math.Pi
+	"net/http"
+	"os"
+	"sort"
+	"strings"
+	"sync" // Importar sync para mutex
+
+	"gioui.org/app"
+	"gioui.org/f32" // Añadir importación para f32.Pt
+	"gioui.org/font/gofont"
+	"gioui.org/io/pointer"
+	"gioui.org/layout"
+	"gioui.org/op"
+	"gioui.org/op/clip"
+	"gioui.org/op/paint"
+	"gioui.org/text"
+	"gioui.org/unit"
+	"gioui.org/widget"
+	"gioui.org/widget/material"
+)
+
+// Estado de la aplicación
+type AppState struct {
+	currentView      ViewType
+	selectedChamp    *ChampionSummary
+	championGrid     widget.List
+	championClicks   []*widget.Clickable
+	championImages   map[int]*image.Image // Cache para imágenes de iconos
+	imgMu            sync.RWMutex         // Mutex para proteger caches de imágenes
+	searchEditor     widget.Editor        // Editor para la barra de búsqueda
+	searchTerm       string               // Término de búsqueda actual
+	selectedSkin     *Skin
+	skinGrid         widget.List
+	skinClicks       []*widget.Clickable
+	skinImages       map[int]*image.Image // Cache para imágenes de skins
+	backClick        widget.Clickable     // Clickable para el botón de retroceso
+	showSkinDialog   bool                 // Estado para mostrar el diálogo de skin
+	closeDialogClick widget.Clickable     // Clickable para cerrar el diálogo
+	splashImage      *image.Image         // Cache para la imagen splash del diálogo
+	splashImageID    int                  // ID de la skin cuya splash está cargada/mostrándose
+	chromaImages     map[int]*image.Image // Cache para imágenes de miniaturas de chroma
+	chromaClicks     []*widget.Clickable  // Clickables para los chromas
+	selectedChromaID int                  // ID del chroma seleccionado actualmente (-1 para ninguno/skin base)
+	win              *app.Window          // Referencia a la ventana para invalidar
+	// Estado para la barra de navegación inferior
+	navTabs     []string // Nombres de las pestañas
+	navClicks   []*widget.Clickable
+	selectedTab int
+	// Estado para la vista de líneas de skin
+	skinLineGrid   widget.List
+	skinLineClicks []*widget.Clickable
+	// TODO: Añadir cache para imágenes de líneas de skin si es necesario
+}
+
+type ViewType int
+
+const (
+	ViewChampionGrid ViewType = iota
+	ViewSkinDetails
+	ViewSkinLines // Nueva vista para líneas de skin
+	// Añadir más vistas si es necesario (e.g., ViewSettings)
+)
+
+var appState AppState
+
+func main() {
+	// Cargar datos
+	if err := loadData(); err != nil {
+		log.Fatalf("Failed to load data: %v", err)
+	}
+
+	// Inicializar estado de la UI
+	appState.currentView = ViewChampionGrid
+	appState.championGrid = widget.List{List: layout.List{Axis: layout.Vertical}}
+	appState.championClicks = make([]*widget.Clickable, len(champions))
+	appState.championImages = make(map[int]*image.Image)
+	appState.skinGrid = widget.List{List: layout.List{Axis: layout.Vertical}}
+	appState.skinImages = make(map[int]*image.Image)
+	appState.chromaImages = make(map[int]*image.Image)                            // Inicializar cache de chromas
+	appState.selectedChromaID = -1                                                // Inicializar chroma seleccionado
+	appState.skinLineGrid = widget.List{List: layout.List{Axis: layout.Vertical}} // Inicializar grid de skinlines
+	// Los skinClicks, chromaClicks y skinLineClicks se inicializarán cuando sea necesario
+
+	// Inicializar estado de la barra de navegación
+	appState.navTabs = []string{"Champions", "Skinlines", "Settings"} // Ejemplo
+	appState.navClicks = make([]*widget.Clickable, len(appState.navTabs))
+	for i := range appState.navTabs {
+		appState.navClicks[i] = new(widget.Clickable)
+	}
+	appState.selectedTab = 0 // Iniciar en la primera pestaña
+
+	for i := range champions {
+		appState.championClicks[i] = new(widget.Clickable)
+		// Iniciar carga de imágenes en segundo plano
+		go loadImage(getChampionIconURL(champions[i].ID), champions[i].ID, true) // true for champion icon
+	}
+
+	go func() {
+		w := new(app.Window)
+		w.Option(
+			app.Title("Skin Hunter - Gio"),
+			app.Size(unit.Dp(1024), unit.Dp(768)),
+		)
+		appState.win = w // Guardar referencia a la ventana
+		if err := run(w); err != nil {
+			log.Fatal(err)
+		}
+		os.Exit(0)
+	}()
+	app.Main()
+}
+
+// loadImage carga una imagen desde una URL y la guarda en el cache apropiado
+func loadImage(url string, id int, isChampionIcon bool) {
+	if url == "" {
+		log.Printf("Skipping load for ID %d due to empty URL", id)
+		return
+	}
+	resp, err := http.Get(url)
+	if err != nil {
+		log.Printf("Failed to fetch image %s: %v", url, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		// No loguear 404 como error grave para tiles/chromas que pueden faltar
+		if resp.StatusCode == http.StatusNotFound && !isChampionIcon && !strings.Contains(url, "champion-splashes") {
+			log.Printf("Image not found (404): %s", url)
+		} else {
+			log.Printf("Bad status fetching image %s: %s", url, resp.Status)
+		}
+		return
+	}
+
+	img, _, err := image.Decode(resp.Body)
+	if err != nil {
+		log.Printf("Failed to decode image %s: %v", url, err)
+		return
+	}
+
+	appState.imgMu.Lock() // Bloquear para escritura segura
+	if isChampionIcon {
+		appState.championImages[id] = &img
+	} else {
+		// Si es una imagen de skin, verificar si es splash, tile o chroma
+		if strings.Contains(url, "champion-splashes") {
+			appState.splashImage = &img
+			appState.splashImageID = id // Guardar ID de la skin/chroma cuya splash se cargó
+		} else if strings.Contains(url, "champion-chroma-images") {
+			appState.chromaImages[id] = &img
+		} else {
+			appState.skinImages[id] = &img // Asumir que es tile
+		}
+	}
+	appState.imgMu.Unlock() // Desbloquear
+
+	// Invalidar la ventana para redibujar
+	if appState.win != nil {
+		appState.win.Invalidate()
+	}
+}
+
+func run(w *app.Window) error {
+	th := material.NewTheme()
+	th.Shaper = text.NewShaper(text.WithCollection(gofont.Collection()))
+	var ops op.Ops
+
+	for {
+		switch e := w.Event().(type) {
+		case app.DestroyEvent:
+			return e.Err
+		case app.FrameEvent:
+			gtx := app.NewContext(&ops, e)
+
+			// Layout principal con barra de aplicación superior y barra de navegación inferior
+			layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+				// Barra de aplicación superior (rígida)
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layoutTopAppBar(gtx, th)
+				}),
+				// Contenido principal (flexible)
+				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+					// Lógica de renderizado basada en el estado
+					switch appState.currentView {
+					case ViewChampionGrid:
+						// Si la pestaña seleccionada no es 'Champions', cambiar la vista
+						// (Esto es un ejemplo, la lógica real podría ser más compleja)
+						if appState.selectedTab != 0 {
+							// TODO: Cambiar a la vista correspondiente a la pestaña
+							// Por ahora, solo mostramos la cuadrícula de campeones
+							layoutChampionGrid(gtx, th)
+						} else {
+							layoutChampionGrid(gtx, th)
+						}
+					case ViewSkinDetails:
+						layoutSkinDetails(gtx, th)
+					case ViewSkinLines: // Manejar la nueva vista
+						layoutSkinLinesGrid(gtx, th)
+						// TODO: Añadir otras vistas según sea necesario
+					default:
+						// Vista por defecto o manejo de error
+						material.Label(th, unit.Sp(16), "Vista desconocida").Layout(gtx)
+					}
+					return layout.Dimensions{Size: gtx.Constraints.Max} // Ocupar espacio disponible
+				}),
+				// Barra de navegación inferior (rígida)
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layoutBottomNavBar(gtx, th)
+				}),
+			)
+
+			e.Frame(gtx.Ops)
+		}
+	}
+}
+
+// layoutTopAppBar dibuja la barra de aplicación superior
+func layoutTopAppBar(gtx layout.Context, th *material.Theme) layout.Dimensions {
+	// Fondo de la barra
+	barColor := th.Palette.Surface // O un color personalizado
+	return layout.Background{}.Layout(gtx,
+		func(gtx layout.Context) layout.Dimensions {
+			paint.Fill(gtx.Ops, barColor)
+			// Altura estándar de la AppBar
+			return layout.Dimensions{Size: image.Point{X: gtx.Constraints.Max.X, Y: gtx.Dp(unit.Dp(56))}}
+		},
+		func(gtx layout.Context) layout.Dimensions {
+			// Contenido de la barra (Título, Iconos, etc.)
+			return layout.Inset{Left: unit.Dp(16), Right: unit.Dp(16)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+					// Título (flexible para ocupar espacio)
+					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+						// Determinar título basado en la vista actual
+						title := "Skin Hunter"
+						switch appState.currentView {
+						case ViewChampionGrid:
+							title = "Champions"
+						case ViewSkinDetails:
+							if appState.selectedChamp != nil {
+								title = appState.selectedChamp.Name
+							}
+						case ViewSkinLines:
+							title = "Skin Lines"
+							// Añadir casos para otras vistas
+						}
+						return material.H6(th, title).Layout(gtx)
+					}),
+					// Iconos de acción (rígidos, añadir más tarde si es necesario)
+					// layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					// 	 // Ejemplo: Icono de búsqueda
+					// 	 return material.IconButton(th, &widget.Clickable{}, searchIcon, "Search").Layout(gtx)
+					// }),
+				)
+			})
+		},
+	)
+}
+
+// layoutBottomNavBar dibuja la barra de navegación inferior
+func layoutBottomNavBar(gtx layout.Context, th *material.Theme) layout.Dimensions {
+	// Fondo de la barra
+	barColor := th.Palette.Surface // O un color personalizado
+	return layout.Background{}.Layout(gtx,
+		func(gtx layout.Context) layout.Dimensions {
+			paint.Fill(gtx.Ops, barColor)
+			return layout.Dimensions{Size: image.Point{X: gtx.Constraints.Max.X, Y: gtx.Dp(unit.Dp(56))}} // Altura estándar
+		},
+		func(gtx layout.Context) layout.Dimensions {
+			// Contenido de la barra (botones/tabs)
+			return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle, Spacing: layout.SpaceAround}.Layout(gtx,
+				func() []layout.FlexChild {
+					children := []layout.FlexChild{}
+					for i, tabName := range appState.navTabs {
+						idx := i // Capturar índice para closure
+						clk := appState.navClicks[idx]
+						children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							// Manejar click en la pestaña
+							if clk.Clicked(gtx) {
+								if appState.selectedTab != idx {
+									appState.selectedTab = idx
+									log.Printf("Selected Tab: %s", appState.navTabs[idx])
+									// Cambiar la vista principal según la pestaña seleccionada
+									switch idx {
+									case 0: // Champions
+										appState.currentView = ViewChampionGrid
+										appState.selectedChamp = nil // Deseleccionar si venimos de detalles
+									case 1: // Skinlines
+										appState.currentView = ViewSkinLines
+									case 2: // Settings
+										// TODO: Implementar vista de Settings
+										log.Printf("Vista para '%s' no implementada aún.", appState.navTabs[idx])
+										// Por ahora, volver a la cuadrícula de campeones
+										appState.currentView = ViewChampionGrid
+									}
+								}
+							}
+
+							// Estilo del botón de la pestaña
+							btn := material.Button(th, clk, tabName)
+							btn.Background = color.NRGBA{} // Fondo transparente
+							// Aumentar padding para mejor toque y apariencia
+							btn.Inset = layout.Inset{Top: unit.Dp(12), Bottom: unit.Dp(12), Left: unit.Dp(16), Right: unit.Dp(16)}
+							if appState.selectedTab == idx {
+								btn.Color = th.Palette.ContrastBg // Color diferente para la pestaña activa
+								// Podríamos añadir un indicador visual (subrayado, etc.) aquí
+							} else {
+								btn.Color = color.NRGBA{R: 180, G: 180, B: 180, A: 255} // Color más tenue para inactivas
+							}
+							return btn.Layout(gtx)
+						}))
+					}
+					return children
+				}()...,
+			)
+		},
+	)
+}
+
+// layoutSkinLinesGrid dibuja la cuadrícula de líneas de skin
+func layoutSkinLinesGrid(gtx layout.Context, th *material.Theme) {
+	// TODO: Añadir barra de búsqueda para skinlines si es necesario
+
+	// Inicializar/Re-inicializar skinLineClicks si es necesario
+	if len(appState.skinLineClicks) != len(skinlines) {
+		appState.skinLineClicks = make([]*widget.Clickable, len(skinlines))
+		for i := range skinlines {
+			appState.skinLineClicks[i] = new(widget.Clickable)
+			// TODO: Cargar imágenes para skinlines si existen y son necesarias
+		}
+	}
+
+	// Calcular número de columnas basado en el ancho disponible
+	// Usar un ancho mayor ya que los nombres pueden ser más largos
+	colWidth := gtx.Dp(unit.Dp(200))
+	numCols := gtx.Constraints.Max.X / colWidth
+	if numCols == 0 {
+		numCols = 1
+	}
+
+	layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		// Título (opcional, ya está en la TopAppBar)
+		// layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+		// 	 return layout.UniformInset(unit.Dp(10)).Layout(gtx, material.H6(th, "Skin Lines").Layout)
+		// }),
+		// Cuadrícula de Líneas de Skin
+		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+			list := &appState.skinLineGrid
+			list.Axis = layout.Vertical
+			return material.List(th, list).Layout(gtx, (len(skinlines)+numCols-1)/numCols, func(gtx layout.Context, rowIndex int) layout.Dimensions {
+				return layout.Flex{Axis: layout.Horizontal, Spacing: layout.SpaceEvenly}.Layout(gtx, // Usar SpaceEvenly para espaciado
+					func() []layout.FlexChild {
+						children := []layout.FlexChild{}
+						for colIndex := 0; colIndex < numCols; colIndex++ {
+							skinLineIndex := rowIndex*numCols + colIndex
+							if skinLineIndex >= len(skinlines) {
+								// Añadir espaciador para mantener alineación en la última fila
+								children = append(children, layout.Rigid(layout.Spacer{Width: unit.Dp(colWidth)}.Layout))
+								continue
+							}
+							skinLine := skinlines[skinLineIndex]
+							// Asegurarse de que el clickable existe
+							if skinLineIndex >= len(appState.skinLineClicks) || appState.skinLineClicks[skinLineIndex] == nil {
+								continue
+							}
+							clk := appState.skinLineClicks[skinLineIndex]
+
+							// Manejar click
+							if clk.Clicked(gtx) {
+								log.Printf("Clicked skin line: %s (ID: %d)", skinLine.Name, skinLine.ID)
+								// TODO: Implementar navegación a una vista que muestre las skins de esta línea
+							}
+
+							children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								// Usar Card para cada línea de skin
+								return material.Card(th, clk).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+									// Añadir padding dentro de la card
+									return layout.UniformInset(unit.Dp(12)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+										// Por ahora, solo mostrar el nombre
+										// TODO: Añadir imagen si se implementa
+										label := material.Body1(th, skinLine.Name)
+										label.Alignment = text.Middle
+										// Darle un tamaño mínimo para que las cards no sean demasiado pequeñas
+										// y un ancho fijo basado en colWidth
+										gtx.Constraints.Min.X = gtx.Dp(unit.Dp(colWidth - 24)) // Restar padding
+										gtx.Constraints.Max.X = gtx.Constraints.Min.X
+										gtx.Constraints.Min.Y = gtx.Dp(unit.Dp(50))
+										return layout.Center.Layout(gtx, label.Layout)
+									})
+								})
+							}))
+						}
+						return children
+					}(),
+				)
+			})
+		}),
+	)
+}
+
+// layoutChampionGrid dibuja la cuadrícula de campeones
+func layoutChampionGrid(gtx layout.Context, th *material.Theme) {
+	// Manejar eventos del editor de búsqueda
+	for _, e := range appState.searchEditor.Events(gtx) {
+		if _, ok := e.(widget.ChangeEvent); ok {
+			appState.searchTerm = appState.searchEditor.Text()
+			// No es necesario filtrar aquí explícitamente si se hace abajo
+			log.Printf("Search term changed: %s", appState.searchTerm)
+		}
+		if _, ok := e.(widget.SubmitEvent); ok {
+			appState.searchTerm = appState.searchEditor.Text()
+			log.Printf("Search submitted: %s", appState.searchTerm)
+		}
+	}
+
+	// Filtrar campeones basado en el término de búsqueda
+	filteredChampions := champions // Empezar con todos
+	if appState.searchTerm != "" {
+		filteredChampions = []ChampionSummary{}
+		lowerSearchTerm := strings.ToLower(appState.searchTerm)
+		for _, champ := range champions {
+			if strings.Contains(strings.ToLower(champ.Name), lowerSearchTerm) || strings.Contains(strings.ToLower(champ.Alias), lowerSearchTerm) {
+				filteredChampions = append(filteredChampions, champ)
+			}
+		}
+	}
+
+	// Recalcular clickables si la lista filtrada es diferente
+	if len(appState.championClicks) != len(filteredChampions) {
+		appState.championClicks = make([]*widget.Clickable, len(filteredChampions))
+		for i := range filteredChampions {
+			appState.championClicks[i] = new(widget.Clickable)
+		}
+	}
+
+	// Calcular número de columnas basado en el ancho disponible
+	colWidth := gtx.Dp(unit.Dp(120)) // Ancho estimado por campeón + padding
+	numCols := gtx.Constraints.Max.X / colWidth
+	if numCols == 0 {
+		numCols = 1
+	}
+
+	layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		// Barra de búsqueda (ya no es necesaria aquí si está en la TopAppBar, pero la dejamos por ahora)
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			ed := material.Editor(th, &appState.searchEditor, "Search Champions...")
+			border := widget.Border{Color: color.NRGBA{A: 100}, CornerRadius: unit.Dp(4), Width: unit.Dp(1)}
+			return border.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return layout.UniformInset(unit.Dp(8)).Layout(gtx, ed.Layout)
+			})
+		}),
+		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+			// Usar len(filteredChampions) para la lista
+			list := &appState.championGrid
+			list.Axis = layout.Vertical // Asegurar eje vertical
+			return material.List(th, list).Layout(gtx, (len(filteredChampions)+numCols-1)/numCols, func(gtx layout.Context, rowIndex int) layout.Dimensions {
+				return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+					func() []layout.FlexChild {
+						children := []layout.FlexChild{}
+						for colIndex := 0; colIndex < numCols; colIndex++ {
+							champIndex := rowIndex*numCols + colIndex
+							if champIndex >= len(filteredChampions) {
+								break // No más campeones
+							}
+							champ := filteredChampions[champIndex]
+							// Asegurarse de que el clickable existe para el índice filtrado
+							if champIndex >= len(appState.championClicks) || appState.championClicks[champIndex] == nil {
+								// Esto no debería suceder si recalculamos arriba, pero por seguridad
+								appState.championClicks[champIndex] = new(widget.Clickable)
+							}
+							clk := appState.championClicks[champIndex]
+
+							// Manejar click
+							if clk.Clicked(gtx) {
+								appState.selectedChamp = &champ
+								appState.currentView = ViewSkinDetails
+								log.Printf("Clicked champion: %s", champ.Name)
+							}
+
+							children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								// Usar Card para cada campeón
+								return material.Card(th, clk).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+									return layout.UniformInset(unit.Dp(8)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+										return layout.Flex{Axis: layout.Vertical, Alignment: layout.Middle}.Layout(gtx,
+											// Imagen
+											layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+												imgSize := unit.Dp(80)
+												gtx.Constraints.Min = image.Point{X: gtx.Dp(imgSize), Y: gtx.Dp(imgSize)}
+												gtx.Constraints.Max = gtx.Constraints.Min
+												appState.imgMu.RLock()
+												imgPtr, ok := appState.championImages[champ.ID]
+												appState.imgMu.RUnlock()
+												if ok && imgPtr != nil {
+													imgWidget := widget.Image{Src: paint.NewImageOp(*imgPtr)}
+-													imgWidget.Fit = widget.Cover // Cubrir el área
+-													imgWidget.Scale = float32(gtx.Dp(thumbSize)) / float32((*imgPtr).Bounds().Min.X) // Escalar para ajustar
++													imgWidget.Fit = widget.Cover                                                              // Cubrir el área
++													imgWidget.Scale = float32(gtx.Dp(thumbSize)) / float32((*imgPtr).Bounds().Dx()) // Escalar por ancho para cubrir
++													if (*imgPtr).Bounds().Dy() < (*imgPtr).Bounds().Dx() {
++														imgWidget.Scale = float32(gtx.Dp(thumbSize)) / float32((*imgPtr).Bounds().Dy()) // Escalar por alto si es más limitante
++													}
+ 													// Aplicar máscara circular (opcional)
+-													// var path clip.Path
+-													// op.Offset(f32.Pt(float32(gtx.Dp(thumbSize/2)), float32(gtx.Dp(thumbSize/2)))).Add(gtx.Ops)
+-													// path.Begin(gtx.Ops)
+-													// path.Arc(0, 0, float32(gtx.Dp(thumbSize/2)), 0, 2*math.Pi)
+-													// path.Close()
+-													// clip.Outline{Path: path.End()}.Op().Add(gtx.Ops)
++													var path clip.Path
++													radius := float32(gtx.Dp(thumbSize / 2))
++													defer clip.Outline{Path: path.End()}.Push(gtx.Ops).Pop()
++													path.Begin(gtx.Ops)
++													// Mover al centro antes de dibujar el arco
++													path.MoveTo(f32.Pt(radius, radius))
++													path.Arc(0, 0, radius, 0, 2*math.Pi)
++													path.Close()
+ 													return imgWidget.Layout(gtx)
+ 												} else {
+ 													// Placeholder
+ 													placeholderRect := image.Rect(0, 0, gtx.Dp(thumbSize), gtx.Dp(thumbSize))
+ 													bgColor := color.NRGBA{R: 50, G: 50, B: 60, A: 255}
+ 													if isSelected {
+-														bgColor = color.NRGBA{R: 70, G: 70, B: 80, A: 255}
++														bgColor = color.NRGBA{R: 70, G: 70, B: 80, A: 255}
+ 													}
+-													paint.FillShape(gtx.Ops, bgColor, clip.Rect(placeholderRect).Op())
++													// Dibujar placeholder circular
++													var path clip.Path
++													radius := float32(gtx.Dp(thumbSize / 2))
++													defer clip.Outline{Path: path.End()}.Push(gtx.Ops).Pop()
++													path.Begin(gtx.Ops)
++													path.MoveTo(f32.Pt(radius, radius))
++													path.Arc(0, 0, radius, 0, 2*math.Pi)
++													path.Close()
++													paint.FillShape(gtx.Ops, bgColor, clip.Outline{Path: path.End()}.Op())
+ 													// Podría añadirse un icono o texto pequeño aquí
+ 													return layout.Dimensions{Size: placeholderRect.Size()}
+ 												}
+											}),
+											// Nombre
+											layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+												return layout.Inset{Top: unit.Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+													label := material.Label(th, unit.Sp(12), champ.Name)
+													label.Alignment = text.Middle
+													return label.Layout(gtx)
+												})
+											}),
+										)
+									})
+								})
+							}))
+						}
+						return children
+					}(),
+				)
+			})
+		}),
+	)
+}
+
+// layoutSkinDetails dibuja la vista de detalles de las skins para el campeón seleccionado
+func layoutSkinDetails(gtx layout.Context, th *material.Theme) {
+	if appState.selectedChamp == nil {
+		// Si no hay campeón seleccionado, volver a la cuadrícula (esto no debería pasar)
+		appState.currentView = ViewChampionGrid
+		// layoutChampionGrid(gtx, th) // No llamar directamente, dejar que el bucle principal lo haga
+		return
+	}
+
+	// Botón de retroceso
+	backClickable := &appState.backClick // Usar el clickable del estado
+	if backClickable.Clicked(gtx) {
+		appState.currentView = ViewChampionGrid
+		appState.selectedChamp = nil // Deseleccionar campeón
+		appState.skinClicks = nil    // Limpiar clicks de skins
+		appState.imgMu.Lock()
+		appState.skinImages = make(map[int]*image.Image) // Limpiar cache de skins
+		appState.imgMu.Unlock()
+	}
+
+	// Obtener skins para el campeón seleccionado
+	championSkins := getChampionSkins(appState.selectedChamp.ID)
+
+	// Inicializar/Re-inicializar skinClicks si es necesario
+	if len(appState.skinClicks) != len(championSkins) {
+		appState.skinClicks = make([]*widget.Clickable, len(championSkins))
+		for i := range championSkins {
+			appState.skinClicks[i] = new(widget.Clickable)
+			// Iniciar carga de imágenes de tile de skin si no está cacheada
+			appState.imgMu.RLock()
+			_, exists := appState.skinImages[championSkins[i].ID]
+			appState.imgMu.RUnlock()
+			if !exists {
+				go loadImage(getSkinTileURL(championSkins[i].ID), championSkins[i].ID, false) // false for skin tile
+			}
+		}
+	}
+
+	layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		// Fila superior: Botón de retroceso y Título
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					// TODO: Usar un icono de flecha
+					return material.Button(th, backClickable, "< Back").Layout(gtx)
+				}),
+				layout.Rigid(layout.Spacer{Width: unit.Dp(10)}.Layout),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return material.H6(th, appState.selectedChamp.Name).Layout(gtx)
+				}),
+			)
+		}),
+		// Espaciador
+		layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
+		// Cuadrícula de Skins
+		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+			// Implementación de la cuadrícula de skins
+			colWidth := gtx.Dp(unit.Dp(150)) // Ancho estimado por skin + padding
+			numCols := gtx.Constraints.Max.X / colWidth
+			if numCols == 0 {
+				numCols = 1
+			}
+
+			list := &appState.skinGrid  // Usar la lista del estado
+			list.Axis = layout.Vertical // Asegurar eje vertical
+			return material.List(th, list).Layout(gtx, (len(championSkins)+numCols-1)/numCols, func(gtx layout.Context, rowIndex int) layout.Dimensions {
+				return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+					func() []layout.FlexChild {
+						children := []layout.FlexChild{}
+						for colIndex := 0; colIndex < numCols; colIndex++ {
+							skinIndex := rowIndex*numCols + colIndex
+							if skinIndex >= len(championSkins) {
+								break // No más skins
+							}
+							skin := championSkins[skinIndex]
+							// Saltar la skin base si existe (opcional, como en el original)
+							// if skin.IsBase { continue }
+
+							// Asegurarse de que el clickable existe
+							if skinIndex >= len(appState.skinClicks) || appState.skinClicks[skinIndex] == nil {
+								continue // O manejar error
+							}
+							clk := appState.skinClicks[skinIndex]
+
+							// Manejar click en skin (abrir diálogo)
+							if clk.Clicked(gtx) {
+								appState.selectedSkin = &skin
+								log.Printf("Clicked skin: %s (ID: %d)", skin.Name, skin.ID)
+								appState.showSkinDialog = true // Mostrar el diálogo
+								appState.selectedChromaID = -1 // Resetear chroma seleccionado
+								// Iniciar carga de splash si no está cacheada o es diferente
+								appState.imgMu.Lock()
+								splashLoaded := appState.splashImageID == skin.ID
+								appState.imgMu.Unlock()
+								if !splashLoaded {
+									appState.imgMu.Lock()
+									appState.splashImage = nil // Limpiar splash anterior
+									appState.imgMu.Unlock()
+									go loadImage(getSkinSplashURL(skin.ID), skin.ID, false)
+								}
+								// Preparar clicks y cargar imágenes de chromas para el diálogo
+								appState.chromaClicks = make([]*widget.Clickable, len(skin.Chromas))
+								for i, chroma := range skin.Chromas {
+									appState.chromaClicks[i] = new(widget.Clickable)
+									// Cargar imagen de chroma si no está cacheada
+									appState.imgMu.RLock()
+									_, exists := appState.chromaImages[chroma.ID]
+									appState.imgMu.RUnlock()
+									if !exists {
+										go loadImage(getChromaURL(chroma.ChromaPath), chroma.ID, false)
+									}
+								}
+							}
+
+							children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return layout.UniformInset(unit.Dp(5)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+									return clk.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+										return layout.Flex{Axis: layout.Vertical, Alignment: layout.Middle}.Layout(gtx,
+											layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+												// Mostrar imagen de tile o placeholder
+												imgWidth := unit.Dp(120)
+												// Asumiendo aspect ratio ~16:9 para tiles (aproximado)
+												imgHeight := imgWidth * 9 / 16
+												gtx.Constraints.Min = image.Point{X: gtx.Dp(imgWidth), Y: gtx.Dp(imgHeight)}
+												gtx.Constraints.Max = gtx.Constraints.Min
+
+												appState.imgMu.RLock()
+												imgPtr, ok := appState.skinImages[skin.ID]
+												appState.imgMu.RUnlock()
+												if ok && imgPtr != nil {
+													imgWidget := widget.Image{Src: paint.NewImageOp(*imgPtr)}
+													imgWidget.Scale = float32(gtx.Dp(imgWidth)) / float32((*imgPtr).Bounds().Dx()) // Escalar por ancho
+													imgWidget.Fit = widget.Contain                                                 // O widget.Cover
+													return imgWidget.Layout(gtx)
+												} else {
+													// Placeholder mientras carga
+													placeholderRect := image.Rect(0, 0, gtx.Dp(imgWidth), gtx.Dp(imgHeight))
+													paint.FillShape(gtx.Ops, color.NRGBA{R: 60, G: 60, B: 70, A: 255}, clip.Rect(placeholderRect).Op())
+													paint.FillShape(gtx.Ops, th.Palette.Bg, clip.Rect(placeholderRect).Op())
+													return layout.Dimensions{Size: placeholderRect.Size()}
+												}
+											}),
+											layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+												return layout.Inset{Top: unit.Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+													label := material.Label(th, unit.Sp(12), skin.Name)
+													label.Alignment = text.Middle
+													return label.Layout(gtx)
+												})
+											}),
+										)
+									})
+								})
+							}))
+						}
+						return children
+					}(),
+				)
+			})
+		}),
+	)
+
+	// Mostrar el diálogo si está activo
+	if appState.showSkinDialog {
+		layoutSkinDialog(gtx, th)
+	}
+}
+
+// layoutSkinDialog dibuja el diálogo de detalles de la skin seleccionada
+func layoutSkinDialog(gtx layout.Context, th *material.Theme) {
+	if appState.selectedSkin == nil {
+		return // No hacer nada si no hay skin seleccionada
+	}
+
+	// Fondo semitransparente oscuro que cubre toda la ventana
+	paint.Fill(gtx.Ops, color.NRGBA{A: 200})
+
+	// Manejar clic fuera del diálogo para cerrarlo (opcional, pero buena UX)
+	// Esto requiere detectar clics en el área fuera del diálogo principal.
+	// Por simplicidad, nos quedamos con el botón de cierre explícito por ahora.
+
+	// Manejar clic en el botón de cerrar
+	if appState.closeDialogClick.Clicked(gtx) {
+		appState.showSkinDialog = false
+		appState.selectedSkin = nil
+		appState.imgMu.Lock()
+		appState.splashImage = nil                         // Limpiar splash
+		appState.splashImageID = -1                        // Resetear ID de splash cargado
+		appState.chromaImages = make(map[int]*image.Image) // Limpiar chromas
+		appState.imgMu.Unlock()
+		appState.chromaClicks = nil
+		appState.selectedChromaID = -1
+		return // Salir para evitar dibujar el resto del diálogo
+	}
+
+	// Centrar el contenido del diálogo
+	layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		// Limitar el tamaño máximo del diálogo
+		maxWidth := gtx.Dp(unit.Dp(900))  // Ajustar ancho para splash + chromas
+		maxHeight := gtx.Dp(unit.Dp(750)) // Ajustar alto
+		if gtx.Constraints.Max.X < maxWidth {
+			maxWidth = gtx.Constraints.Max.X - gtx.Dp(20) // Dejar margen
+		}
+		if gtx.Constraints.Max.Y < maxHeight {
+			maxHeight = gtx.Constraints.Max.Y - gtx.Dp(20) // Dejar margen
+		}
+		gtx.Constraints.Max.X = maxWidth
+		gtx.Constraints.Max.Y = maxHeight
+
+		// Card para el fondo del diálogo
+		// Usamos un clickable vacío para que la Card capture los clics dentro de ella
+		// y no se propaguen al fondo (evitando cierre accidental si se implementa)
+		return material.Card(th, &widget.Clickable{}).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			// Padding interno del diálogo
+			return layout.UniformInset(unit.Dp(16)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+					// Fila superior: Título y Botón de cerrar
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Flex{Alignment: layout.Middle, Spacing: layout.SpaceBetween}.Layout(gtx,
+							layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+								// Determinar el nombre a mostrar (skin o chroma)
+								displayName := appState.selectedSkin.Name
+								if appState.selectedChromaID != -1 {
+									for _, chroma := range appState.selectedSkin.Chromas {
+										if chroma.ID == appState.selectedChromaID {
+											// Combinar nombre de skin y chroma para claridad
+											displayName = fmt.Sprintf("%s (%s)", appState.selectedSkin.Name, chroma.Name)
+											break
+										}
+									}
+								}
+								label := material.H6(th, displayName)
+								label.Alignment = text.Start
+								return label.Layout(gtx)
+							}),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								// Botón de cerrar estilizado
+								closeButton := material.IconButton(th, &appState.closeDialogClick, nil, "Close") // Usar IconButton para mejor semántica
+								// TODO: Añadir un icono de 'X' real usando un widget.Icon
+								// Por ahora, usamos texto como placeholder del icono
+								return material.ButtonLayoutStyle{Button: closeButton.Button}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+									return layout.Inset{Top: unit.Dp(4), Bottom: unit.Dp(4), Left: unit.Dp(8), Right: unit.Dp(8)}.Layout(gtx,
+										material.Label(th, unit.Sp(18), "✕").Layout,
+									)
+								})
+							}),
+						)
+					}),
+
+					// Espaciador
+					layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
+
+					// Contenido principal: Splash y Chromas
+					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+						return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+							// Columna Izquierda: Splash Image
+							layout.Flexed(0.7, func(gtx layout.Context) layout.Dimensions {
+								// Determinar qué splash mostrar (base o chroma)
+								splashIDToShow := appState.selectedSkin.ID
+								if appState.selectedChromaID != -1 {
+									splashIDToShow = appState.selectedChromaID
+								}
+
+								appState.imgMu.RLock()
+								imgPtr := appState.splashImage
+								isCorrectSplashLoaded := appState.splashImageID == splashIDToShow
+								appState.imgMu.RUnlock()
+
+								if isCorrectSplashLoaded && imgPtr != nil {
+									imgWidget := widget.Image{Src: paint.NewImageOp(*imgPtr)}
+									imgWidget.Fit = widget.Contain // Ajustar imagen manteniendo aspecto
+									// Escalar para llenar el ancho disponible
+									imgWidget.Scale = float32(gtx.Constraints.Max.X) / float32((*imgPtr).Bounds().Dx())
+									return imgWidget.Layout(gtx)
+								} else {
+									// Placeholder mientras carga o si falta la imagen
+									// Calcular altura basada en ratio 16:9 (común para splashes)
+									placeholderHeight := gtx.Constraints.Max.X * 9 / 16
+									if placeholderHeight > gtx.Constraints.Max.Y {
+										placeholderHeight = gtx.Constraints.Max.Y
+									}
+									placeholderRect := image.Rect(0, 0, gtx.Constraints.Max.X, placeholderHeight)
+									paint.FillShape(gtx.Ops, color.NRGBA{R: 40, G: 40, B: 50, A: 255}, clip.Rect(placeholderRect).Op())
+									// Añadir texto de carga
+									return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+										return material.Label(th, unit.Sp(14), "Loading Splash...").Layout(gtx)
+									})
+								}
+							}),
+							// Espaciador entre splash y chromas
+							layout.Rigid(layout.Spacer{Width: unit.Dp(16)}.Layout),
+
+							// Columna Derecha: Chromas (si existen)
+							layout.Flexed(0.3, func(gtx layout.Context) layout.Dimensions {
+								if len(appState.selectedSkin.Chromas) == 0 {
+									return layout.Dimensions{} // No mostrar nada si no hay chromas
+								}
+
+								// Lista vertical para los chromas
+								list := widget.List{List: layout.List{Axis: layout.Vertical}}
+								return material.List(th, &list).Layout(gtx, len(appState.selectedSkin.Chromas)+1, func(gtx layout.Context, index int) layout.Dimensions {
+									// Añadir padding entre elementos de la lista
+									return layout.Inset{Bottom: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+										// Elemento 0: Opción para mostrar la skin base
+										if index == 0 {
+											clk := new(widget.Clickable) // Clickable temporal para la base
+											if clk.Clicked(gtx) {
+												if appState.selectedChromaID != -1 {
+													appState.selectedChromaID = -1
+													// Recargar splash base si es necesario
+													appState.imgMu.Lock()
+													splashLoaded := appState.splashImageID == appState.selectedSkin.ID
+													appState.imgMu.Unlock()
+													if !splashLoaded {
+														appState.imgMu.Lock()
+														appState.splashImage = nil
+														appState.imgMu.Unlock()
+														go loadImage(getSkinSplashURL(appState.selectedSkin.ID), appState.selectedSkin.ID, false)
+													}
+												}
+											}
+											// Dibujar miniatura de la skin base (usando tile?)
+											return drawChromaThumbnail(gtx, th, clk, appState.selectedSkin.ID, "Base Skin", true, appState.selectedChromaID == -1)
+										}
+
+										// Elementos > 0: Chromas reales
+										chromaIndex := index - 1
+										if chromaIndex >= len(appState.selectedSkin.Chromas) || chromaIndex >= len(appState.chromaClicks) {
+											return layout.Dimensions{} // Índice fuera de rango
+										}
+										chroma := appState.selectedSkin.Chromas[chromaIndex]
+										clk := appState.chromaClicks[chromaIndex]
+
+										// Manejar click en chroma
+										if clk.Clicked(gtx) {
+											if appState.selectedChromaID != chroma.ID {
+												appState.selectedChromaID = chroma.ID
+												// Iniciar carga del splash del chroma
+												// Asumimos que getChromaSplashURL existe o que getSkinSplashURL puede manejar IDs de chroma
+												// Si los chromas no tienen splash propio, podríamos no hacer nada aquí o mostrar un mensaje.
+												// Por ahora, intentamos cargar usando el ID del chroma como si fuera una skin.
+												appState.imgMu.Lock()
+												splashLoaded := appState.splashImageID == chroma.ID
+												appState.imgMu.Unlock()
+												if !splashLoaded {
+													appState.imgMu.Lock()
+													appState.splashImage = nil // Limpiar splash anterior
+													appState.imgMu.Unlock()
+													// TODO: Verificar si existe una URL específica para splash de chromas
+													// Si no, podríamos seguir mostrando el splash base o intentar cargar con getSkinSplashURL(chroma.ID)
+													go loadImage(getSkinSplashURL(chroma.ID), chroma.ID, false)
+												}
+											}
+										}
+
+										// Dibujar miniatura del chroma
+										return drawChromaThumbnail(gtx, th, clk, chroma.ID, chroma.Name, false, appState.selectedChromaID == chroma.ID)
+									})
+								})
+							}),
+						)
+					}),
+
+					// Espaciador antes de la descripción (opcional)
+					layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
+
+					// Descripción de la skin (opcional, puede quitarse si el espacio es limitado)
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						// Limitar altura y añadir scroll si es necesario (simplificado por ahora)
+						desc := appState.selectedSkin.Description
+						if desc == "" {
+							desc = "This skin does not have a description."
+						}
+						// Usar un área de texto con scroll si la descripción es larga
+						// Por ahora, solo un label simple
+						return material.Body2(th, desc).Layout(gtx)
+					}),
+				)
+			})
+		})
+	})
+}
+
+// drawChromaThumbnail dibuja una miniatura para un chroma o la skin base
+func drawChromaThumbnail(gtx layout.Context, th *material.Theme, clk *widget.Clickable, id int, name string, isBase bool, isSelected bool) layout.Dimensions {
+	thumbSize := unit.Dp(60) // Tamaño de la miniatura
+	gtx.Constraints.Min = image.Point{X: gtx.Dp(thumbSize), Y: gtx.Dp(thumbSize)}
+	gtx.Constraints.Max.X = gtx.Dp(thumbSize)
+
+	// Intentar obtener la imagen (tile para base, chroma para chromas)
+	var imgPtr *image.Image
+	var ok bool
+	appState.imgMu.RLock()
+	if isBase {
+		// Usar icono de campeón para la miniatura base en lugar del tile
+		if appState.selectedChamp != nil {
+			imgPtr, ok = appState.championImages[appState.selectedChamp.ID]
+		} else {
+			ok = false // No hay campeón seleccionado, no se puede mostrar icono
+		}
+	} else {
+		imgPtr, ok = appState.chromaImages[id] // Usar imagen de chroma
+	}
+	appState.imgMu.RUnlock()
+
+	// Borde para indicar selección
+	borderCol := color.NRGBA{} // Sin borde por defecto
+	if isSelected {
+		borderCol = th.Palette.ContrastBg // Color de borde cuando está seleccionado
+	}
+	border := widget.Border{Color: borderCol, CornerRadius: unit.Dp(4), Width: unit.Dp(2)}
+
+	return border.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return clk.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			// Layout interno de la miniatura (imagen o placeholder)
+			return layout.Stack{}.Layout(gtx,
+				// Imagen
+				layout.Expanded(func(gtx layout.Context) layout.Dimensions {
+					if ok && imgPtr != nil {
+						imgWidget := widget.Image{Src: paint.NewImageOp(*imgPtr)}
+-							imgWidget.Fit = widget.Cover // Cubrir el área
+-							imgWidget.Scale = float32(gtx.Dp(thumbSize)) / float32((*imgPtr).Bounds().Min.X) // Escalar para ajustar
++							imgWidget.Fit = widget.Cover                                                              // Cubrir el área
++							imgWidget.Scale = float32(gtx.Dp(thumbSize)) / float32((*imgPtr).Bounds().Dx()) // Escalar por ancho para cubrir
++							if (*imgPtr).Bounds().Dy() < (*imgPtr).Bounds().Dx() {
++								imgWidget.Scale = float32(gtx.Dp(thumbSize)) / float32((*imgPtr).Bounds().Dy()) // Escalar por alto si es más limitante
++							}
+ 							// Aplicar máscara circular (opcional)
+-							// var path clip.Path
+-							// op.Offset(f32.Pt(float32(gtx.Dp(thumbSize/2)), float32(gtx.Dp(thumbSize/2)))).Add(gtx.Ops)
+-							// path.Begin(gtx.Ops)
+-							// path.Arc(0, 0, float32(gtx.Dp(thumbSize/2)), 0, 2*math.Pi)
+-							// path.Close()
+-							// clip.Outline{Path: path.End()}.Op().Add(gtx.Ops)
++							var path clip.Path
++							radius := float32(gtx.Dp(thumbSize / 2))
++							defer clip.Outline{Path: path.End()}.Push(gtx.Ops).Pop()
++							path.Begin(gtx.Ops)
++							// Mover al centro antes de dibujar el arco
++							path.MoveTo(f32.Pt(radius, radius))
++							path.Arc(0, 0, radius, 0, 2*math.Pi)
++							path.Close()
+ 							return imgWidget.Layout(gtx)
+ 						} else {
+ 							// Placeholder
+ 							placeholderRect := image.Rect(0, 0, gtx.Dp(thumbSize), gtx.Dp(thumbSize))
+ 							bgColor := color.NRGBA{R: 50, G: 50, B: 60, A: 255}
+ 							if isSelected {
+-								bgColor = color.NRGBA{R: 70, G: 70, B: 80, A: 255}
++								bgColor = color.NRGBA{R: 70, G: 70, B: 80, A: 255}
+ 							}
+-							paint.FillShape(gtx.Ops, bgColor, clip.Rect(placeholderRect).Op())
++							// Dibujar placeholder circular
++							var path clip.Path
++							radius := float32(gtx.Dp(thumbSize / 2))
++							defer clip.Outline{Path: path.End()}.Push(gtx.Ops).Pop()
++							path.Begin(gtx.Ops)
++							path.MoveTo(f32.Pt(radius, radius))
++							path.Arc(0, 0, radius, 0, 2*math.Pi)
++							path.Close()
++							paint.FillShape(gtx.Ops, bgColor, clip.Outline{Path: path.End()}.Op())
+ 							// Podría añadirse un icono o texto pequeño aquí
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size()}
+ 						}
+ 							return layout.Dimensions{Size: placeholderRect.Size

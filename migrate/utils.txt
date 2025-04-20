@@ -1,0 +1,203 @@
+package ui
+
+import (
+	"bytes"
+	"image"
+	"image/color"
+	"io"
+	"log"
+	"net/http"
+	"time"
+
+	"skinhunter/data"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+
+	// Asegúrate que los decoders están en main.go
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
+	// _ "golang.org/x/image/webp"
+)
+
+// LoadImageFromURL loads an image asynchronously and returns a container with placeholder
+func LoadImageFromURL(urlStr string, width, height float32) *fyne.Container {
+	placeholder := canvas.NewRectangle(theme.InputBorderColor())
+	placeholder.SetMinSize(fyne.NewSize(width, height))
+	imgWidget := canvas.NewImageFromResource(theme.QuestionIcon())
+	imgWidget.FillMode = canvas.ImageFillContain
+	imgWidget.SetMinSize(fyne.NewSize(width, height))
+	imgWidget.Hide()
+
+	loadingIndicator := widget.NewProgressBarInfinite()
+	loadingIndicator.Hide()
+
+	stackContainer := container.NewStack(placeholder, container.NewCenter(loadingIndicator), imgWidget)
+
+	log.Printf("INFO: Image URL to load: %s", urlStr)
+
+	go func() {
+		// loadingIndicator.Show() // Mostrar antes de la goroutine puede ser mejor
+
+		// --- DEBUG: Descargar manualmente ---
+		client := &http.Client{Timeout: time.Second * 15}
+		req, err := http.NewRequest("GET", urlStr, nil)
+		if err != nil {
+			log.Printf("ERROR: Failed to create request for %s: %v", urlStr, err)
+			// Actualizar UI (llamada directa a widget)
+			imgWidget.Resource = theme.BrokenImageIcon()
+			imgWidget.Show()
+			loadingIndicator.Hide()
+			stackContainer.Refresh() // Refrescar contenedor padre
+			return
+		}
+		req.Header.Set("User-Agent", "SkinHunterFyneApp/1.0")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("ERROR: Failed to GET image %s: %v", urlStr, err)
+			imgWidget.Resource = theme.BrokenImageIcon()
+			imgWidget.Show()
+			loadingIndicator.Hide()
+			stackContainer.Refresh()
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			log.Printf("ERROR: Bad status code %d for image %s", resp.StatusCode, urlStr)
+			log.Printf("ERROR: Response body (status %d): %s", resp.StatusCode, string(bodyBytes))
+			imgWidget.Resource = theme.BrokenImageIcon()
+			imgWidget.Show()
+			loadingIndicator.Hide()
+			stackContainer.Refresh()
+			return
+		}
+
+		imageData, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Printf("ERROR: Failed to read image body %s: %v", urlStr, err)
+			imgWidget.Resource = theme.BrokenImageIcon()
+			imgWidget.Show()
+			loadingIndicator.Hide()
+			stackContainer.Refresh()
+			return
+		}
+		contentType := resp.Header.Get("Content-Type")
+		log.Printf("DEBUG: Read %d bytes for image %s. Content-Type: %s", len(imageData), urlStr, contentType)
+		// --- FIN DEBUG ---
+
+		res := fyne.NewStaticResource(urlStr, imageData)
+		var resourceToSet fyne.Resource = theme.BrokenImageIcon()
+		var decodeSuccessful bool = false
+
+		if res != nil {
+			_, format, decodeErr := image.DecodeConfig(bytes.NewReader(imageData))
+			if decodeErr != nil {
+				log.Printf("ERROR: Manual image.DecodeConfig failed for %s: %v. Content-Type was '%s'. Image data might be corrupt or format not supported/imported.", urlStr, decodeErr, contentType)
+			} else {
+				log.Printf("DEBUG: Manual decode success for %s. Detected format: %s", urlStr, format)
+				resourceToSet = res
+				decodeSuccessful = true
+			}
+		} else {
+			log.Printf("ERROR: Resource is nil for %s even after manual download", urlStr)
+		}
+
+		// *** ACTUALIZAR UI CON LLAMADAS DIRECTAS A WIDGETS ***
+		imgWidget.Resource = resourceToSet
+		if decodeSuccessful || err == nil {
+			imgWidget.Show()
+		}
+		loadingIndicator.Hide()
+		imgWidget.Refresh()
+		stackContainer.Refresh() // Refrescar el contenedor es importante
+		log.Printf("DEBUG: UI updated for %s (decode success: %v)", urlStr, decodeSuccessful)
+
+	}() // Fin de la goroutine
+
+	// Mostrar indicador aquí si se quitó de la goroutine
+	// loadingIndicator.Show()
+
+	return stackContainer
+}
+
+// Tappable Card sin cambios
+type tappableCard struct {
+	widget.BaseWidget
+	content  fyne.CanvasObject
+	onTapped func()
+}
+
+func newTappableCard(content fyne.CanvasObject, onTap func()) *tappableCard {
+	c := &tappableCard{content: content, onTapped: onTap}
+	c.ExtendBaseWidget(c)
+	return c
+}
+func (c *tappableCard) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(c.content)
+}
+func (c *tappableCard) Tapped(_ *fyne.PointEvent) {
+	if c.onTapped != nil {
+		c.onTapped()
+	}
+}
+
+// --- Specific Item Widgets ---
+
+// ChampionGridItem sin cambios funcionales
+func ChampionGridItem(champ data.ChampionSummary, onSelect func(champ data.ChampionSummary)) fyne.CanvasObject {
+	imgURL := data.GetChampionSquarePortraitURLFromCDragon(champ)
+	imgContainer := LoadImageFromURL(imgURL, 80, 80)
+	nameLabel := widget.NewLabel(champ.Name)
+	nameLabel.Alignment = fyne.TextAlignCenter
+	nameLabel.Truncation = fyne.TextTruncateEllipsis
+	cardContent := container.NewVBox(imgContainer, nameLabel)
+	tapButton := widget.NewButton("", func() { onSelect(champ) })
+	return container.NewStack(cardContent, tapButton)
+}
+
+// SkinGridItem sin cambios funcionales
+func SkinGridItem(skin data.Skin, onSelect func(skin data.Skin)) fyne.CanvasObject {
+	if skin.IsBase {
+		return nil
+	}
+	imgURL := data.GetSkinTileURL(skin)
+	imgContainer := LoadImageFromURL(imgURL, 200, 200)
+	nameLabel := widget.NewLabel(skin.Name)
+	nameLabel.Wrapping = fyne.TextTruncate
+	icons := []fyne.CanvasObject{}
+	if skin.IsLegacy {
+		legacyIconRes := data.GetLegacyIconResource()
+		if legacyIconRes != nil {
+			legacyIcon := canvas.NewImageFromResource(legacyIconRes)
+			legacyIcon.SetMinSize(fyne.NewSize(20, 20))
+			icons = append(icons, legacyIcon)
+		}
+	}
+	// TODO: Ícono de Chromas si skin.Chromas existe y tiene elementos
+	iconsContainer := container.NewHBox(icons...)
+	rarityIconRes := data.GetRarityIconResource(skin)
+	var rarityIcon *canvas.Image
+	if rarityIconRes != nil {
+		rarityIcon = canvas.NewImageFromResource(rarityIconRes)
+		rarityIcon.SetMinSize(fyne.NewSize(16, 16))
+	}
+	bottomBarContent := []fyne.CanvasObject{}
+	if rarityIcon != nil {
+		bottomBarContent = append(bottomBarContent, rarityIcon)
+	}
+	bottomBarContent = append(bottomBarContent, nameLabel)
+	bottomBar := container.NewHBox(bottomBarContent...)
+	bgRect := canvas.NewRectangle(color.NRGBA{R: 0, G: 0, B: 0, A: 128})
+	bottomBarContainer := container.NewMax(bgRect, container.NewPadded(bottomBar))
+	contentStack := container.NewStack(imgContainer, container.NewVBox(container.NewPadded(iconsContainer), layout.NewSpacer(), bottomBarContainer))
+	tapButton := widget.NewButton("", func() { onSelect(skin) })
+	return container.NewStack(contentStack, tapButton)
+}

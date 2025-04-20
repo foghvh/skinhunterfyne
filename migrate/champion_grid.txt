@@ -1,0 +1,31 @@
+package ui
+
+import (
+	"log"
+
+	"skinhunter/data" // Import your data package
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/container"
+)
+
+// NewChampionGrid creates the scrollable grid of champions
+func NewChampionGrid(champions []data.ChampionSummary, onSelect func(champ data.ChampionSummary)) fyne.CanvasObject {
+	grid := container.NewGridWithColumns(6) // Ajusta columnas si es necesario (6 queda bien con 80px)
+
+	// Add champion items to the grid
+	for _, champ := range champions {
+		// Capture loop variable correctamente para la closure
+		selectedChamp := champ
+		item := ChampionGridItem(selectedChamp, func(c data.ChampionSummary) {
+			// Log actualizado para usar ID numérico y Alias
+			log.Printf("Champion selected: %s (ID: %d, Alias: %s)", c.Name, c.ID, c.Alias) // <- Cambiado Key a ID y Alias
+			onSelect(c)                                                                    // onSelect todavía pasa el objeto ChampionSummary completo
+		})
+		grid.Add(item)
+	}
+
+	// No necesitamos retornar un scroll aquí si main.go ya lo envuelve
+	// return container.NewScroll(grid)
+	return grid // Devolver solo el grid
+}

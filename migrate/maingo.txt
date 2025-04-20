@@ -1,0 +1,236 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"strings"
+
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
+
+	// _ "golang.org/x/image/webp"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+
+	"image/color"
+	"skinhunter/data"
+	"skinhunter/ui"
+)
+
+const appName = "Skin Hunter Fyne"
+
+type skinHunterApp struct {
+	fyneApp fyne.App
+	window  fyne.Window
+
+	// UI Elements
+	header        fyne.CanvasObject
+	centerContent *fyne.Container // Contenedor principal que cambiaremos
+	filterToolbar *widget.Toolbar // Barra para filtros (se muestra/oculta)
+	tabs          *container.AppTabs
+
+	// State
+	currentView   string
+	statusLabel   *widget.Label
+	allChampions  []data.ChampionSummary
+	currentFilter string
+}
+
+func main() {
+	a := app.New()
+	w := a.NewWindow(appName)
+	w.Resize(fyne.NewSize(1024, 768))
+	shApp := &skinHunterApp{
+		fyneApp:       a,
+		window:        w,
+		centerContent: container.NewMax(),
+		currentView:   "champions_grid",
+		currentFilter: "all",
+	}
+	shApp.header = shApp.createHeader()
+	shApp.tabs = shApp.createTabs()
+	shApp.filterToolbar = shApp.createFilterToolbar()
+	shApp.loadInitialChampionData()
+	mainLayout := container.NewBorder(
+		shApp.header, shApp.tabs, nil, nil, shApp.centerContent,
+	)
+	w.SetContent(mainLayout)
+	w.SetMaster()
+	w.CenterOnScreen()
+	w.ShowAndRun()
+}
+
+// createHeader sin cambios
+func (sh *skinHunterApp) createHeader() fyne.CanvasObject {
+	logoRes, err := fyne.LoadResourceFromURLString("https://i.imgur.com/m40l0qA.png")
+	var logo fyne.CanvasObject
+	if err != nil {
+		log.Println("Failed to load logo:", err)
+		logo = widget.NewLabel("Skin Hunter")
+	} else {
+		logoImg := canvas.NewImageFromResource(logoRes)
+		logoImg.FillMode = canvas.ImageFillContain
+		logoImg.SetMinSize(fyne.NewSize(150, 30))
+		logo = logoImg
+	}
+	sh.statusLabel = widget.NewLabel("Ready to start")
+	sh.statusLabel.Alignment = fyne.TextAlignCenter
+	// Usar HBox con Spacer para centrar correctamente
+	headerContent := container.NewHBox(
+		logo,
+		layout.NewSpacer(),
+		sh.statusLabel,
+		layout.NewSpacer(),
+		// Placeholder invisible para equilibrar si es necesario
+		canvas.NewRectangle(color.Transparent),
+	)
+	// Añadir padding alrededor del HBox
+	return container.NewPadded(headerContent)
+}
+
+// createTabs sin cambios
+func (sh *skinHunterApp) createTabs() *container.AppTabs {
+	// Placeholder content, la lógica real cambia shApp.centerContent
+	return container.NewAppTabs(
+		container.NewTabItemWithIcon("Champions", theme.ListIcon(), widget.NewLabel("Champions Content Placeholder")),
+		container.NewTabItemWithIcon("Search", theme.SearchIcon(), widget.NewLabel("Search Content Placeholder")),
+		container.NewTabItemWithIcon("Installed", theme.DownloadIcon(), widget.NewLabel("Installed Content Placeholder")),
+		container.NewTabItemWithIcon("Profile", theme.HomeIcon(), widget.NewLabel("Profile Content Placeholder")),
+	)
+	// TODO: Añadir OnSelected al AppTabs para cambiar vistas si se usan otras tabs
+}
+
+// updateStatus sin cambios
+func (sh *skinHunterApp) updateStatus(status string) {
+	if sh.statusLabel != nil {
+		sh.statusLabel.SetText(status)
+	}
+}
+
+// createFilterToolbar - Crear la barra pero no añadirla al layout principal aún
+func (sh *skinHunterApp) createFilterToolbar() *widget.Toolbar {
+	roles := []string{"all", "assassin", "fighter", "mage", "marksman", "support", "tank"}
+	actions := []widget.ToolbarItem{}
+
+	for _, role := range roles {
+		currentRole := role
+		// Crear un botón normal para poder ponerle texto fácilmente
+		roleButton := widget.NewButton(strings.Title(currentRole), func() { // Usar nombre capitalizado
+			sh.filterChampionsByRole(currentRole)
+		})
+		// Envolver el botón en un ToolbarAction si se quiere usar Toolbar estrictamente
+		// O simplemente usar HBox para la barra de filtros
+		actions = append(actions, widget.NewToolbarAction(theme.ListIcon(), func() { // Icono placeholder
+			roleButton.OnTapped() // Llamar al OnTapped del botón
+		}))
+		// TODO: Reemplazar ToolbarAction con el roleButton directamente si se usa HBox en lugar de Toolbar
+
+		if currentRole != roles[len(roles)-1] {
+			actions = append(actions, widget.NewToolbarSeparator())
+		}
+	}
+	toolbar := widget.NewToolbar(actions...)
+	// toolbar.Hide() // No es necesario ocultar aquí, se controla en setContent
+	return toolbar
+}
+
+// loadInitialChampionData - Carga datos y llama a filter para mostrar grid inicial
+func (sh *skinHunterApp) loadInitialChampionData() {
+	sh.updateStatus("Loading champions...")
+	loadingIndicator := widget.NewProgressBarInfinite()
+	sh.setContent(container.NewCenter(loadingIndicator), false) // Mostrar solo loading
+
+	go func() {
+		champions, err := data.FetchAllChampions()
+		if err != nil {
+			log.Printf("Failed to load champions: %v", err)
+			sh.updateStatus("Error loading champions")
+			errorLabel := widget.NewLabel(fmt.Sprintf("Error: %v", err))
+			sh.setContent(container.NewCenter(errorLabel), false) // Mostrar error
+			return
+		}
+
+		sh.allChampions = champions
+		sh.filterChampionsByRole(sh.currentFilter) // Mostrar grid inicial ("all")
+		sh.updateStatus(fmt.Sprintf("%d Champions Loaded", len(sh.allChampions)))
+	}()
+}
+
+// filterChampionsByRole - Filtra y actualiza el contenido central
+func (sh *skinHunterApp) filterChampionsByRole(role string) {
+	sh.currentFilter = role
+	log.Printf("Filtering champions by role: %s", role)
+
+	filteredChampions := []data.ChampionSummary{}
+	if role == "all" {
+		filteredChampions = sh.allChampions
+	} else {
+		for _, champ := range sh.allChampions {
+			for _, r := range champ.Roles {
+				if strings.ToLower(r) == strings.ToLower(role) {
+					filteredChampions = append(filteredChampions, champ)
+					break
+				}
+			}
+		}
+	}
+
+	championGrid := container.NewGridWithColumns(6)
+	if len(filteredChampions) == 0 {
+		championGrid.Add(widget.NewLabel(fmt.Sprintf("No champions found for role: %s", role)))
+	} else {
+		for _, champ := range filteredChampions {
+			selectedChamp := champ // Capturar variable
+			// *** ASEGURARSE QUE ESTA LLAMADA ES CORRECTA ***
+			// La firma de onSelect debe ser func(data.ChampionSummary)
+			item := ui.ChampionGridItem(selectedChamp, func(c data.ChampionSummary) { sh.showChampionView(c) }) // <-- Pasar 'c'
+			championGrid.Add(item)
+		}
+	}
+
+	scrollableGrid := container.NewScroll(championGrid)
+	sh.setContent(container.NewBorder(sh.filterToolbar, nil, nil, nil, scrollableGrid), true)
+	sh.currentView = "champions_grid"
+	log.Printf("Displayed %d champions for role %s", len(filteredChampions), role)
+}
+
+// showChampionView - Muestra vista de detalle, oculta filtros
+func (sh *skinHunterApp) showChampionView(champion data.ChampionSummary) {
+	sh.updateStatus(fmt.Sprintf("Loading %s...", champion.Name))
+	sh.currentView = "champion_view"
+
+	// Crear la vista de detalle (que ahora carga datos internamente)
+	championViewContent := ui.NewChampionView(
+		champion,
+		func() { // OnBack
+			sh.filterChampionsByRole(sh.currentFilter) // Volver a la vista filtrada
+		},
+		func(skin data.Skin) { // OnSkinSelect
+			ui.ShowSkinDialog(skin, sh.window)
+		},
+	)
+
+	// Establecer contenido SIN la barra de filtros
+	sh.setContent(championViewContent, false) // Ocultar filtros
+	log.Printf("Switching to champion view for %s", champion.Name)
+}
+
+// setContent - Helper para actualizar el área central y manejar visibilidad de filtros
+func (sh *skinHunterApp) setContent(content fyne.CanvasObject, showFilters bool) {
+	if showFilters {
+		sh.filterToolbar.Show() // Asegurarse que la barra es visible
+		// Usar Border layout para poner filtros arriba del contenido principal
+		sh.centerContent.Objects = []fyne.CanvasObject{container.NewBorder(sh.filterToolbar, nil, nil, nil, content)}
+	} else {
+		sh.filterToolbar.Hide()                                 // Ocultar la barra si no se necesita
+		sh.centerContent.Objects = []fyne.CanvasObject{content} // Mostrar solo el contenido
+	}
+	sh.centerContent.Refresh() // Refrescar el contenedor central
+}
