@@ -1,31 +1,47 @@
+// skinhunter/ui/champion_grid.go
 package ui
 
 import (
+	"fmt"
 	"log"
 
-	"skinhunter/data" // Import your data package
+	"skinhunter/data"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/widget"
 )
 
-// NewChampionGrid creates the scrollable grid of champions
-func NewChampionGrid(champions []data.ChampionSummary, onSelect func(champ data.ChampionSummary)) fyne.CanvasObject {
-	grid := container.NewGridWithColumns(6) // Ajusta columnas si es necesario (6 queda bien con 80px)
+// NewChampionGrid creates the scrollable grid of champions.
+func NewChampionGrid(onChampionSelect func(champ data.ChampionSummary)) fyne.CanvasObject {
+	contentArea := container.NewMax()
+	loading := widget.NewProgressBarInfinite()
+	contentArea.Add(container.NewCenter(loading))
 
-	// Add champion items to the grid
-	for _, champ := range champions {
-		// Capture loop variable correctamente para la closure
-		selectedChamp := champ
-		item := ChampionGridItem(selectedChamp, func(c data.ChampionSummary) {
-			// Log actualizado para usar ID numérico y Alias
-			log.Printf("Champion selected: %s (ID: %d, Alias: %s)", c.Name, c.ID, c.Alias) // <- Cambiado Key a ID y Alias
-			onSelect(c)                                                                    // onSelect todavía pasa el objeto ChampionSummary completo
-		})
-		grid.Add(item)
-	}
+	go func() {
+		champions, err := data.FetchAllChampions()
+		if err != nil {
+			log.Printf("Error fetching champions: %v", err)
+			errorLabel := widget.NewLabel(fmt.Sprintf("Error loading champions:\n%v", err))
+			errorLabel.Wrapping = fyne.TextWrapWord
+			contentArea.Objects = []fyne.CanvasObject{container.NewCenter(errorLabel)}
+			contentArea.Refresh()
+			return
+		}
 
-	// No necesitamos retornar un scroll aquí si main.go ya lo envuelve
-	// return container.NewScroll(grid)
-	return grid // Devolver solo el grid
+		grid := container.NewGridWithColumns(9)
+		for _, champ := range champions {
+			item := ChampionGridItem(champ, onChampionSelect)
+			if item != nil {
+				grid.Add(item)
+			}
+		}
+
+		scrollContainer := container.NewScroll(grid)
+		contentArea.Objects = []fyne.CanvasObject{scrollContainer}
+		contentArea.Refresh()
+		log.Println("Champion grid UI updated")
+	}()
+
+	return contentArea
 }

@@ -7,31 +7,56 @@ import (
 	"image/color"
 	"log"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	// NO FYNE IMPORTS HERE
 )
 
 const (
-	cDragonBase         = "https://raw.communitydragon.org/latest"
-	cDragonDataBE       = cDragonBase + "/plugins/rcp-be-lol-game-data/global/default"
+	cDragonBase = "https://raw.communitydragon.org/latest"
+	// !! dataRoot should be used for API calls like skins.json, champions.json !!
+	dataRootAPI         = cDragonBase + "/plugins/rcp-be-lol-game-data/global/default"
 	cDragonStaticAssets = cDragonBase + "/plugins/rcp-fe-lol-static-assets/global/default"
-	cDragonAssetBase    = "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default" // Used by asset()
+	// !! Base URL for constructing final ASSET URLs from relative paths !!
+	// Corrected base URL for assets based on observed working URLs
+	assetURLBase = "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default" // Explicitly set full base
+	// Prefix to remove from JSON paths before converting to lower case and appending
+	jsonAssetPathPrefix = "/lol-game-data/assets" // The prefix from the JSON data itself
 )
 
 var (
 	httpClient          = &http.Client{Timeout: time.Second * 15} // Shared client
 	championListCache   []ChampionSummary
 	championDetailCache = make(map[int]*DetailedChampionData) // Use Champion ID (int) as key
-	skinLinesCache      []SkinLine
+	skinLinesCache      []SkinLine                            // Currently unused but defined
 	cacheMutex          sync.RWMutex
-	cDragonVersion      string
+	cDragonVersion      string          // Store the fetched version
 	allSkinsMap         map[string]Skin // Map skin ID (string) to Skin struct
 )
 
-// --- Structs --- (Remain the same as previous correct version)
+// Define loggers (keep user's setup)
+var (
+	debugLogger     = log.New(os.Stdout, "[DEBUG] ", log.Ltime|log.Lshortfile)
+	imageLogFile, _ = os.OpenFile("c:\\Users\\dev\\buenoche\\image_debug.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666) // Use user's path
+	imageLogger     *log.Logger                                                                                           // Initialize in init or main
+)
+
+func init() {
+	// Initialize imageLogger safely
+	if imageLogFile != nil {
+		imageLogger = log.New(imageLogFile, "[IMAGE] ", log.Ltime|log.Lshortfile)
+	} else {
+		// Fallback to stdout if file failed to open
+		imageLogger = log.New(os.Stdout, "[IMAGE_ERR] ", log.Ltime|log.Lshortfile)
+		imageLogger.Println("Failed to open image log file, logging to stdout.")
+	}
+}
+
+// --- Structs ---
 type ChampionSummary struct {
 	ID                 int      `json:"id"`
 	Name               string   `json:"name"`
@@ -40,27 +65,24 @@ type ChampionSummary struct {
 	Roles              []string `json:"roles"`
 	Key                string   `json:"key"`
 }
-
 type SkinLine struct {
 	ID   int
 	Name string
 }
-
 type Skin struct {
 	ID                   int                `json:"id"`
 	Name                 string             `json:"name"`
 	TilePath             string             `json:"tilePath"`
 	SplashPath           string             `json:"splashPath"`
 	UncenteredSplashPath string             `json:"uncenteredSplashPath"`
+	LoadScreenPath       string             `json:"loadScreenPath"`
 	Description          string             `json:"description"`
 	Rarity               string             `json:"rarityGemPath"`
 	IsLegacy             bool               `json:"isLegacy"`
-	IsBase               bool               `json:"isBase"`
+	IsBase               bool               // Calculated
 	Chromas              []Chroma           `json:"chromas"`
 	SkinLines            []struct{ ID int } `json:"skinLines"`
-	LoadScreenPath       string             `json:"loadScreenPath"`
 }
-
 type DetailedChampionData struct {
 	ID                 int      `json:"id"`
 	Name               string   `json:"name"`
@@ -71,169 +93,200 @@ type DetailedChampionData struct {
 	Roles              []string `json:"roles"`
 	Skins              []Skin   `json:"skins"`
 }
-
 type Chroma struct {
 	ID           int      `json:"id"`
 	Name         string   `json:"name"`
 	ChromaPath   string   `json:"chromaPath"`
 	Colors       []string `json:"colors"`
-	OriginSkinID int      `json:"-"`
+	OriginSkinID int      `json:"-"` // Calculated
 }
 
-// --- Initialization and Caching --- (Remain the same)
+// --- Initialization and Caching ---
 func InitData() error {
 	log.Println("Initializing data...")
 	cacheMutex.Lock()
-	defer cacheMutex.Unlock()
 	if len(championListCache) > 0 && len(allSkinsMap) > 0 {
+		cacheMutex.Unlock()
 		log.Println("Data already initialized.")
 		return nil
 	}
+	cacheMutex.Unlock()
+
 	err := fetchCDragonVersion()
 	if err != nil {
-		log.Printf("WARN: Could not fetch CDragon version: %v. Using 'latest'.", err)
+		log.Printf("WARN: Failed to fetch CDragon version: %v. Using 'latest'.", err)
 		cDragonVersion = "latest"
 	} else {
 		log.Printf("Using CDragon version: %s", cDragonVersion)
 	}
+
 	champions, err := fetchChampionSummary()
 	if err != nil {
-		return fmt.Errorf("failed to initialize champions: %w", err)
+		return fmt.Errorf("failed to fetch champion summary: %w", err)
 	}
-	championListCache = champions
-	log.Printf("Initialized %d champions.", len(championListCache))
 	allSkins, err := fetchSkinsJSON()
 	if err != nil {
-		return fmt.Errorf("failed to initialize skins: %w", err)
+		return fmt.Errorf("failed to fetch skins JSON: %w", err)
 	}
+
+	cacheMutex.Lock()
+	championListCache = champions
 	allSkinsMap = allSkins
-	log.Printf("Initialized %d skins.", len(allSkinsMap))
-	log.Println("Data initialization complete.")
+	cacheMutex.Unlock()
+
+	log.Printf("Data initialized successfully: %d champions, %d skins.", len(championListCache), len(allSkinsMap))
 	return nil
 }
 
-func fetchCDragonVersion() error {
-	url := fmt.Sprintf("%s/content-metadata.json", cDragonBase)
-	resp, err := httpClient.Get(url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("bad status fetching version: %s", resp.Status)
-	}
-	var metadata struct {
-		Version string `json:"version"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
-		return err
-	}
-	if metadata.Version == "" {
-		return fmt.Errorf("version field missing in content-metadata.json")
-	}
-	cDragonVersion = metadata.Version
-	return nil
-}
+func fetchCDragonVersion() error { cDragonVersion = "latest"; return nil } // Hardcoded for now
 
 func fetchChampionSummary() ([]ChampionSummary, error) {
-	url := fmt.Sprintf("%s/v1/champion-summary.json", cDragonDataBE)
+	url := fmt.Sprintf("%s/v1/champion-summary.json", dataRootAPI)
+	log.Printf("Fetching champion summary from: %s", url)
 	resp, err := httpClient.Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("failed http GET champion summary: %w", err)
+		return nil, fmt.Errorf("http get failed for champion summary: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("bad status fetching champion summary: %s", resp.Status)
+		return nil, fmt.Errorf("bad status code for champion summary: %s", resp.Status)
 	}
 	var data []ChampionSummary
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return nil, fmt.Errorf("failed to decode champion summary JSON: %w", err)
 	}
-	champions := make([]ChampionSummary, 0, len(data))
-	for _, champ := range data {
-		if champ.ID != -1 {
-			champ.Key = strings.ToLower(champ.Alias)
-			champions = append(champions, champ)
+	champs := make([]ChampionSummary, 0, len(data))
+	for _, ch := range data {
+		if ch.ID != -1 && ch.Name != "" && ch.Alias != "" {
+			ch.Key = strings.ToLower(ch.Alias)
+			ch.SquarePortraitPath = ensureLeadingSlash(ch.SquarePortraitPath)
+			champs = append(champs, ch)
+		} else {
+			log.Printf("WARN: Skipping invalid champion entry: ID=%d, Name='%s'", ch.ID, ch.Name)
 		}
 	}
-	sort.Slice(champions, func(i, j int) bool { return champions[i].Name < champions[j].Name })
-	return champions, nil
+	sort.Slice(champs, func(i, j int) bool { return champs[i].Name < champs[j].Name })
+	log.Printf("Successfully fetched and processed %d champions.", len(champs))
+	return champs, nil
 }
 
 func FetchAllChampions() ([]ChampionSummary, error) {
 	cacheMutex.RLock()
-	defer cacheMutex.RUnlock()
-	if len(championListCache) == 0 {
-		log.Println("Champion list cache empty, attempting initialization...")
+	if len(championListCache) > 0 {
+		listCopy := make([]ChampionSummary, len(championListCache))
+		copy(listCopy, championListCache)
 		cacheMutex.RUnlock()
-		initErr := InitData()
-		cacheMutex.RLock()
-		if initErr != nil {
-			return nil, fmt.Errorf("champion list not initialized and init failed: %w", initErr)
-		}
-		if len(championListCache) == 0 {
-			return nil, fmt.Errorf("champion list still empty after initialization attempt")
-		}
+		return listCopy, nil
 	}
-	// log.Println("Serving champions from cache") // Less noisy
-	return championListCache, nil
+	cacheMutex.RUnlock()
+	log.Println("Champion cache empty, attempting re-initialization...")
+	initErr := InitData()
+	if initErr != nil {
+		return nil, fmt.Errorf("champion cache empty and re-initialization failed: %w", initErr)
+	}
+	cacheMutex.RLock()
+	if len(championListCache) == 0 {
+		cacheMutex.RUnlock()
+		return nil, fmt.Errorf("champion cache still empty after re-initialization")
+	}
+	listCopy := make([]ChampionSummary, len(championListCache))
+	copy(listCopy, championListCache)
+	cacheMutex.RUnlock()
+	return listCopy, nil
 }
 
 func fetchSkinsJSON() (map[string]Skin, error) {
-	url := fmt.Sprintf("%s/v1/skins.json", cDragonDataBE)
+	url := fmt.Sprintf("%s/v1/skins.json", dataRootAPI)
+	log.Printf("Fetching skins JSON from: %s", url)
 	resp, err := httpClient.Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("failed http GET skins.json: %w", err)
+		return nil, fmt.Errorf("http get failed for skins JSON: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("bad status fetching skins.json: %s", resp.Status)
+		return nil, fmt.Errorf("bad status code for skins JSON: %s", resp.Status)
 	}
 	var data map[string]Skin
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return nil, fmt.Errorf("failed to decode skins.json: %w", err)
+		return nil, fmt.Errorf("failed to decode skins JSON: %w", err)
 	}
 	processedData := make(map[string]Skin, len(data))
-	for idStr, skin := range data {
+	for idStr, s := range data {
 		skinID, err := strconv.Atoi(idStr)
 		if err != nil {
-			log.Printf("WARN: Could not parse skin ID string '%s' from skins.json: %v", idStr, err)
+			log.Printf("WARN: Skipping skin with invalid ID '%s': %v", idStr, err)
 			continue
 		}
-		skin.ID = skinID
-		skin.IsBase = (skinID%1000 == 0)
-		for i := range skin.Chromas {
-			skin.Chromas[i].OriginSkinID = skin.ID
+		s.ID = skinID
+		s.IsBase = (skinID%1000 == 0)
+		s.TilePath = ensureLeadingSlash(s.TilePath)
+		s.SplashPath = ensureLeadingSlash(s.SplashPath)
+		s.UncenteredSplashPath = ensureLeadingSlash(s.UncenteredSplashPath)
+		s.LoadScreenPath = ensureLeadingSlash(s.LoadScreenPath)
+		s.Rarity = ensureLeadingSlash(s.Rarity)
+		if len(s.Chromas) > 0 {
+			processedChromas := make([]Chroma, len(s.Chromas))
+			for i, ch := range s.Chromas {
+				ch.OriginSkinID = s.ID
+				ch.ChromaPath = ensureLeadingSlash(ch.ChromaPath)
+				processedChromas[i] = ch
+			}
+			s.Chromas = processedChromas
 		}
-		processedData[idStr] = skin
+		processedData[idStr] = s
 	}
+	log.Printf("Successfully fetched and processed %d skins.", len(processedData))
 	return processedData, nil
+}
+
+func ensureLeadingSlash(path string) string {
+	if path != "" && !strings.HasPrefix(path, "/") {
+		return "/" + path
+	}
+	return path
 }
 
 func GetAllSkinsMap() (map[string]Skin, error) {
 	cacheMutex.RLock()
-	defer cacheMutex.RUnlock()
 	if len(allSkinsMap) == 0 {
-		return nil, fmt.Errorf("skins map not initialized, call data.InitData() first")
+		cacheMutex.RUnlock()
+		log.Printf("WARN: Skin map cache was empty, attempting re-init...")
+		err := InitData()
+		cacheMutex.RLock()
+		if err != nil {
+			return nil, fmt.Errorf("skin map cache empty and re-init failed: %w", err)
+		}
+		if len(allSkinsMap) == 0 {
+			return nil, fmt.Errorf("skin map cache still empty after re-init")
+		}
 	}
-	return allSkinsMap, nil
+	mapCopy := make(map[string]Skin, len(allSkinsMap))
+	for k, v := range allSkinsMap {
+		mapCopy[k] = v
+	}
+	cacheMutex.RUnlock()
+	return mapCopy, nil
 }
 
 func GetSkinsForChampion(championID int) ([]Skin, error) {
 	cacheMutex.RLock()
-	defer cacheMutex.RUnlock()
 	if len(allSkinsMap) == 0 {
+		cacheMutex.RUnlock()
 		return nil, fmt.Errorf("skins map not initialized")
 	}
 	skins := make([]Skin, 0)
-	for _, skin := range allSkinsMap {
-		if GetChampionIDFromSkinID(skin.ID) == championID {
-			for i := range skin.Chromas {
-				skin.Chromas[i].OriginSkinID = skin.ID
+	for _, s := range allSkinsMap {
+		if GetChampionIDFromSkinID(s.ID) == championID {
+			processedChromas := make([]Chroma, len(s.Chromas))
+			for i, ch := range s.Chromas {
+				ch.OriginSkinID = s.ID
+				processedChromas[i] = ch
 			}
-			skins = append(skins, skin)
+			s.Chromas = processedChromas
+			skins = append(skins, s)
 		}
 	}
+	cacheMutex.RUnlock()
 	sort.Slice(skins, func(i, j int) bool { return skins[i].ID < skins[j].ID })
 	return skins, nil
 }
@@ -247,172 +300,176 @@ func GetChampionIDFromSkinID(skinID int) int {
 
 func FetchChampionDetails(championID int) (*DetailedChampionData, error) {
 	cacheMutex.RLock()
-	if cachedData, found := championDetailCache[championID]; found {
-		cacheMutex.RUnlock()
-		log.Printf("Serving detailed champion %d from cache", championID)
+	cachedData, found := championDetailCache[championID]
+	cacheMutex.RUnlock()
+	if found {
+		log.Printf("Cache hit for champion details: %d", championID)
 		return cachedData, nil
 	}
-	cacheMutex.RUnlock()
-	log.Printf("Fetching details for champion %d from CDragon...", championID)
-	url := fmt.Sprintf("%s/v1/champions/%d.json", cDragonDataBE, championID)
+	log.Printf("Cache miss, fetching details for champion: %d", championID)
+	url := fmt.Sprintf("%s/v1/champions/%d.json", dataRootAPI, championID)
 	resp, err := httpClient.Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("failed http GET for champion %d details: %w", championID, err)
+		return nil, fmt.Errorf("http get failed for champion details %d: %w", championID, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("champion %d not found (404)", championID)
+		return nil, fmt.Errorf("champion details not found (404) for ID: %d", championID)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("bad status %d for champion %d details", resp.StatusCode, championID)
+		return nil, fmt.Errorf("bad status code for champion details %d: %s", championID, resp.Status)
 	}
-	var champDetails DetailedChampionData
-	if err := json.NewDecoder(resp.Body).Decode(&champDetails); err != nil {
-		return nil, fmt.Errorf("failed to decode JSON for champion %d details: %w", championID, err)
+	var details DetailedChampionData
+	if err := json.NewDecoder(resp.Body).Decode(&details); err != nil {
+		return nil, fmt.Errorf("failed to decode champion details JSON for %d: %w", championID, err)
 	}
-	for i := range champDetails.Skins {
-		originSkinID := champDetails.Skins[i].ID
-		champDetails.Skins[i].IsBase = (originSkinID%1000 == 0)
-		for j := range champDetails.Skins[i].Chromas {
-			champDetails.Skins[i].Chromas[j].OriginSkinID = originSkinID
+	processedSkins := make([]Skin, len(details.Skins))
+	for i, s := range details.Skins {
+		s.IsBase = (s.ID%1000 == 0)
+		s.TilePath = ensureLeadingSlash(s.TilePath)
+		s.SplashPath = ensureLeadingSlash(s.SplashPath)
+		s.UncenteredSplashPath = ensureLeadingSlash(s.UncenteredSplashPath)
+		s.LoadScreenPath = ensureLeadingSlash(s.LoadScreenPath)
+		s.Rarity = ensureLeadingSlash(s.Rarity)
+		if len(s.Chromas) > 0 {
+			processedChromas := make([]Chroma, len(s.Chromas))
+			for j, ch := range s.Chromas {
+				ch.OriginSkinID = s.ID
+				ch.ChromaPath = ensureLeadingSlash(ch.ChromaPath)
+				processedChromas[j] = ch
+			}
+			s.Chromas = processedChromas
 		}
+		processedSkins[i] = s
 	}
+	details.Skins = processedSkins
+	details.SquarePortraitPath = ensureLeadingSlash(details.SquarePortraitPath)
 	cacheMutex.Lock()
-	championDetailCache[championID] = &champDetails
+	championDetailCache[championID] = &details
 	cacheMutex.Unlock()
-	log.Printf("Fetched and cached details for champion %d (%s)", championID, champDetails.Name)
-	return &champDetails, nil
+	log.Printf("Successfully fetched and cached details for champion %d (%s)", championID, details.Name)
+	return &details, nil
 }
 
 func GetSkinDetails(skinID int) (Skin, error) {
 	cacheMutex.RLock()
-	skinIDStr := fmt.Sprintf("%d", skinID)
-	cachedSkin, found := allSkinsMap[skinIDStr]
+	idStr := fmt.Sprintf("%d", skinID)
+	cachedSkin, foundInMap := allSkinsMap[idStr]
 	cacheMutex.RUnlock()
-	if found {
-		for i := range cachedSkin.Chromas {
-			cachedSkin.Chromas[i].OriginSkinID = skinID
+	if foundInMap {
+		processedChromas := make([]Chroma, len(cachedSkin.Chromas))
+		for i, ch := range cachedSkin.Chromas {
+			ch.OriginSkinID = cachedSkin.ID
+			processedChromas[i] = ch
 		}
-		cachedSkin.IsBase = (skinID%1000 == 0)
+		cachedSkin.Chromas = processedChromas
+		cachedSkin.IsBase = (cachedSkin.ID%1000 == 0)
 		return cachedSkin, nil
-	} else {
-		log.Printf("WARN: Skin %d not in initial map. Trying champ detail fetch...", skinID)
-		champID := GetChampionIDFromSkinID(skinID)
-		if champID <= 0 {
-			return Skin{}, fmt.Errorf("invalid champion ID for skin %d", skinID)
-		}
-		champDetails, err := FetchChampionDetails(champID)
-		if err != nil {
-			return Skin{}, fmt.Errorf("skin %d not in map, champ %d fetch failed: %w", skinID, champID, err)
-		}
-		for _, s := range champDetails.Skins {
-			if s.ID == skinID {
-				log.Printf("Found skin %d in champ %d details", skinID, champID)
-				s.IsBase = (skinID%1000 == 0)
-				for i := range s.Chromas {
-					s.Chromas[i].OriginSkinID = skinID
-				}
-				return s, nil
-			}
-		}
-		return Skin{}, fmt.Errorf("skin %d not found in map or champ %d details", skinID, champID)
 	}
+	log.Printf("WARN: Skin %d not found in initial map, attempting fetch via champion details.", skinID)
+	championID := GetChampionIDFromSkinID(skinID)
+	if championID <= 0 {
+		return Skin{}, fmt.Errorf("invalid champion ID derived from skin ID %d", skinID)
+	}
+	details, err := FetchChampionDetails(championID)
+	if err != nil {
+		return Skin{}, fmt.Errorf("failed to fetch champion details for %d to find skin %d: %w", championID, skinID, err)
+	}
+	for _, s := range details.Skins {
+		if s.ID == skinID {
+			log.Printf("Found skin %d within details for champion %d (%s)", skinID, championID, details.Name)
+			processedChromas := make([]Chroma, len(s.Chromas))
+			for i, ch := range s.Chromas {
+				ch.OriginSkinID = s.ID
+				processedChromas[i] = ch
+			}
+			s.Chromas = processedChromas
+			s.IsBase = (s.ID%1000 == 0)
+			return s, nil
+		}
+	}
+	return Skin{}, fmt.Errorf("skin ID %d not found in map or champion %d details", skinID, championID)
 }
 
-// --- URL Helper Functions (like data.js) ---
-
-// !!! MODIFIED Asset function - Removed lowercasing on path construction !!!
+// --- URL Helper Functions ---
 func Asset(path string) string {
 	if path == "" {
-		return GetPlaceholderImageURL() // Return placeholder for empty paths
+		imageLogger.Printf("❌ Asset path is empty, returning placeholder.")
+		return GetPlaceholderImageURL()
 	}
-	lowerPathCheck := strings.ToLower(path) // Use lowercase ONLY for checks
-
-	// Check if already a full URL
-	if strings.HasPrefix(lowerPathCheck, "http://") || strings.HasPrefix(lowerPathCheck, "https://") {
-		return path // Assume it's correct
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
 	}
-
-	// Standardize path separators just in case
-	// Use original path for concatenation as case might matter
-	correctedPath := strings.ReplaceAll(path, "\\", "/")
-
-	// Handle paths relative to plugin root
-	// Use lowercase for prefix check, but concatenate original path
-	if strings.HasPrefix(lowerPathCheck, "/plugins/") {
-		// Ensure no double slash if cDragonBase already ends with one (it doesn't)
-		return cDragonBase + correctedPath
+	imageLogger.Printf("➡️ Input Asset Path: '%s'", path)
+	if strings.HasPrefix(strings.ToLower(path), "http://") || strings.HasPrefix(strings.ToLower(path), "https://") {
+		imageLogger.Printf("⚠️ Path looks like a full URL, returning as-is: '%s'", path)
+		return path
 	}
-
-	// Handle paths seemingly relative to lol-game-data/assets
-	if strings.HasPrefix(lowerPathCheck, "/lol-game-data/assets") {
-		// Strip prefix based on lowercase check, get relative part from original path
-		// This assumes the casing of the prefix itself doesn't matter, but suffix might
-		prefixLen := len("/lol-game-data/assets")
-		if len(correctedPath) > prefixLen {
-			relativePath := correctedPath[prefixLen:]
-			// Ensure relativePath starts with a single '/' if needed
-			if !strings.HasPrefix(relativePath, "/") {
-				relativePath = "/" + relativePath
-			}
-			return cDragonAssetBase + relativePath
-		} else {
-			log.Printf("WARN: Path '%s' matches asset prefix but is too short.", path)
-			return GetPlaceholderImageURL() // Avoid constructing bad URL
+	if strings.HasPrefix(strings.ToLower(path), jsonAssetPathPrefix) {
+		relativePath := path[len(jsonAssetPathPrefix):]
+		lowerRelativePath := strings.ToLower(relativePath)
+		correctedBase := strings.TrimSuffix(assetURLBase, "/")
+		if !strings.HasPrefix(lowerRelativePath, "/") {
+			lowerRelativePath = "/" + lowerRelativePath
 		}
+		resultURL := correctedBase + lowerRelativePath
+		imageLogger.Printf("✅ Generated Asset URL: '%s' (Base: '%s', Rel: '%s')", resultURL, correctedBase, lowerRelativePath)
+		return resultURL
+	} else {
+		imageLogger.Printf("⚠️ Asset path '%s' missing expected prefix '%s'. Attempting direct append fallback.", path, jsonAssetPathPrefix)
+		lowerPath := strings.ToLower(path)
+		if !strings.HasPrefix(lowerPath, "/") {
+			lowerPath = "/" + lowerPath
+		}
+		resultURL := strings.TrimSuffix(assetURLBase, "/") + lowerPath
+		imageLogger.Printf("⚠️ Fallback URL: '%s'", resultURL)
+		return resultURL
 	}
-
-	// If path looks like just the suffix (e.g., v1/champion-icons/1.png)
-	// Assume it's relative to AssetBase - *Keep original casing*
-	if !strings.HasPrefix(correctedPath, "/") && (strings.HasSuffix(lowerPathCheck, ".png") || strings.HasSuffix(lowerPathCheck, ".jpg") || strings.HasSuffix(lowerPathCheck, ".webp") || strings.HasSuffix(lowerPathCheck, ".svg")) {
-		// log.Printf("DEBUG: Assuming relative asset path '%s' starts from CDragon Asset Base", correctedPath)
-		return cDragonAssetBase + "/" + correctedPath
-	}
-
-	// Log the problematic path and return placeholder
-	log.Printf("WARN: Could not determine absolute URL for asset path '%s', using placeholder.", path)
-	return GetPlaceholderImageURL()
 }
 
-// GetChampionSquarePortraitURL uses the path from ChampionSummary.
 func GetChampionSquarePortraitURL(champ ChampionSummary) string {
-	// Example champ.SquarePortraitPath: "/lol-game-data/assets/v1/champion-icons/1.png"
+	imageLogger.Printf("Getting champion portrait for: %s (Path: %s)", champ.Name, champ.SquarePortraitPath)
 	return Asset(champ.SquarePortraitPath)
 }
-
-// GetSkinTileURL uses the TilePath or LoadScreenPath from the Skin struct.
 func GetSkinTileURL(skin Skin) string {
-	// Example TilePath: "/lol-game-data/assets/v1/champion-tiles/103/103001.jpg"
-	// Example LoadScreenPath: "/lol-game-data/assets/v1/champion-loadscreens/103/103001.jpg"
 	path := skin.TilePath
-	if path == "" {
-		path = skin.LoadScreenPath // Common fallback for tiles
+	if path == "" && skin.LoadScreenPath != "" {
+		imageLogger.Printf("Skin tile path empty for ID %d (%s), using LoadScreenPath fallback.", skin.ID, skin.Name)
+		path = skin.LoadScreenPath
+	} else if path == "" {
+		imageLogger.Printf("❌ Skin tile path AND LoadScreenPath empty for ID %d (%s).", skin.ID, skin.Name)
+		return GetPlaceholderImageURL()
 	}
-	// Log the path being used for tiles
-	// log.Printf("DEBUG: Tile path for skin %s (%d): %s", skin.Name, skin.ID, path)
+	imageLogger.Printf("Getting skin tile/loadscreen for ID %d (%s) (Path: %s)", skin.ID, skin.Name, path)
 	return Asset(path)
 }
-
-// GetSkinSplashURL uses the SplashPath or UncenteredSplashPath from the Skin struct.
 func GetSkinSplashURL(skin Skin) string {
-	// Example SplashPath: "/lol-game-data/assets/v1/champion-splashes/103/103001.jpg"
-	// Example Uncentered: "/lol-game-data/assets/v1/champion-splashes/uncentered/103/103001.jpg"
 	path := skin.SplashPath
-	if skin.UncenteredSplashPath != "" { // Prefer uncentered if exists? Usually larger.
+	if skin.UncenteredSplashPath != "" {
+		imageLogger.Printf("Using uncentered splash for skin ID %d (%s)", skin.ID, skin.Name)
 		path = skin.UncenteredSplashPath
+	} else if path == "" {
+		imageLogger.Printf("❌ Skin splash path AND UncenteredSplashPath empty for ID %d (%s).", skin.ID, skin.Name)
+		fallbackPath := skin.TilePath
+		if fallbackPath == "" {
+			fallbackPath = skin.LoadScreenPath
+		}
+		if fallbackPath != "" {
+			imageLogger.Printf("Falling back to Tile/LoadScreen path for splash: %s", fallbackPath)
+			path = fallbackPath
+		} else {
+			return GetPlaceholderImageURL()
+		}
 	}
-	// log.Printf("DEBUG: Splash path for skin %s (%d): %s", skin.Name, skin.ID, path)
+	imageLogger.Printf("Getting skin splash for ID %d (%s) (Path: %s)", skin.ID, skin.Name, path)
 	return Asset(path)
 }
-
-// GetChromaImageURL uses the ChromaPath from the Chroma struct.
 func GetChromaImageURL(chroma Chroma) string {
-	// Example ChromaPath: "/lol-game-data/assets/v1/champion-chroma-images/103/103001.png"
-	// log.Printf("DEBUG: Chroma path for chroma %s (%d): %s", chroma.Name, chroma.ID, chroma.ChromaPath)
+	imageLogger.Printf("Getting chroma image for ID %d (%s) (Path: %s)", chroma.ID, chroma.Name, chroma.ChromaPath)
 	return Asset(chroma.ChromaPath)
 }
 
-// KhadaUrl, Placeholder, Rarity, LegacyIconURL, ChromaIconURL, ParseHexColor - Remain the same
+// --- Other Helper Functions ---
 func KhadaUrl(skinID int, chromaID int) string {
 	baseURL := "https://modelviewer.lol/model-viewer?id="
 	if chromaID > 0 && skinID != chromaID && GetChampionIDFromSkinID(skinID) == GetChampionIDFromSkinID(chromaID) {
@@ -424,29 +481,24 @@ func GetPlaceholderImageURL() string {
 	return "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
 }
 
-var rarityMap = map[string][2]string{
-	"raritygem_ultimate.png":     {"Ultimate", "ultimate.png"},
-	"raritygem_mythic.png":       {"Mythic", "mythic.png"},
-	"raritygem_legendary.png":    {"Legendary", "legendary.png"},
-	"raritygem_epic.png":         {"Epic", "epic.png"},
-	"raritygem_transcendent.png": {"Transcendent", "transcendent.png"},
-	"raritygem_exalted.png":      {"Exalted", "exalted.png"},
-}
+var rarityMap = map[string][2]string{"raritygem_ultimate.png": {"Ultimate", "ultimate.png"}, "raritygem_mythic.png": {"Mythic", "mythic.png"}, "raritygem_legendary.png": {"Legendary", "legendary.png"}, "raritygem_epic.png": {"Epic", "epic.png"}, "raritygem_transcendent.png": {"Transcendent", "transcendent.png"}, "raritygem_exalted.png": {"Exalted", "exalted.png"}}
 
-func Rarity(skin Skin) (name string, iconURL string) {
+func Rarity(skin Skin) (string, string) {
 	if skin.Rarity == "" {
-		return "", ""
+		return "Standard", ""
 	}
-	lowerRarityPath := strings.ToLower(skin.Rarity)
-	for pathSuffix, data := range rarityMap {
-		if strings.HasSuffix(lowerRarityPath, pathSuffix) {
-			name = data[0]
+	lowerPath := strings.ToLower(skin.Rarity)
+	for suffix, data := range rarityMap {
+		if strings.HasSuffix(lowerPath, suffix) {
+			displayName := data[0]
 			iconFilename := data[1]
-			iconURL = fmt.Sprintf("%s/v1/rarity-gem-icons/%s", cDragonDataBE, iconFilename)
-			return name, iconURL
+			iconPath := fmt.Sprintf("%s/v1/rarity-gem-icons/%s", jsonAssetPathPrefix, iconFilename)
+			iconURL := Asset(iconPath)
+			return displayName, iconURL
 		}
 	}
-	return "", ""
+	log.Printf("WARN: Unknown rarity gem path format: %s", skin.Rarity)
+	return "Unknown", ""
 }
 func LegacyIconURL() string {
 	return fmt.Sprintf("%s/images/summoner-icon/icon-legacy.png", cDragonStaticAssets)
@@ -454,17 +506,16 @@ func LegacyIconURL() string {
 func ChromaIconURL() string {
 	return fmt.Sprintf("%s/images/skin-viewer/icon-chroma-default.png", cDragonStaticAssets)
 }
-
 func ParseHexColor(s string) (color.NRGBA, error) {
 	if s == "" {
-		return color.NRGBA{R: 128, G: 128, B: 128, A: 255}, fmt.Errorf("empty color string")
+		return color.NRGBA{128, 128, 128, 255}, fmt.Errorf("empty hex string")
 	}
 	if strings.HasPrefix(s, "#") {
 		s = s[1:]
 	}
-	c := color.NRGBA{A: 255}
-	var r, g, b uint64
+	var r, g, b, a uint64
 	var err error
+	a = 255
 	switch len(s) {
 	case 6:
 		r, err = strconv.ParseUint(s[0:2], 16, 8)
@@ -490,20 +541,15 @@ func ParseHexColor(s string) (color.NRGBA, error) {
 		if err == nil {
 			b, err = strconv.ParseUint(s[4:6], 16, 8)
 		}
-		var a uint64
 		if err == nil {
 			a, err = strconv.ParseUint(s[6:8], 16, 8)
-			c.A = uint8(a)
 		}
 	default:
-		err = fmt.Errorf("invalid hex length: %d", len(s))
+		err = fmt.Errorf("invalid hex string length: %d", len(s))
 	}
 	if err != nil {
-		log.Printf("WARN: Error parsing hex color '%s': %v. Using gray.", s, err)
-		return color.NRGBA{R: 128, G: 128, B: 128, A: 255}, err
+		log.Printf("WARN: Failed to parse hex color string '%s': %v", s, err)
+		return color.NRGBA{128, 128, 128, 255}, err
 	}
-	c.R = uint8(r)
-	c.G = uint8(g)
-	c.B = uint8(b)
-	return c, nil
+	return color.NRGBA{uint8(r), uint8(g), uint8(b), uint8(a)}, nil
 }

@@ -2,7 +2,7 @@
 package ui
 
 import (
-	// "log" // Uncomment if needed for debugging
+	// "log"
 
 	"skinhunter/data"
 
@@ -12,33 +12,27 @@ import (
 )
 
 // NewSkinsGrid creates a scrollable grid of skins for a specific champion.
-// Takes skins directly, as they are expected to be fetched by the caller (NewChampionView).
 func NewSkinsGrid(skins []data.Skin, onSkinSelect func(skin data.Skin)) fyne.CanvasObject {
-	// Adjust columns based on SkinItem size (~200px wide + padding)
-	// Aim for 3-4 columns typically. Let's use 3.
+	// *** Revert to 3 columns to match screenshot ***
 	grid := container.NewGridWithColumns(3)
 
 	if skins == nil || len(skins) == 0 {
-		// log.Println("No skins data provided to NewSkinsGrid")
-		return container.NewCenter(widget.NewLabel("No skins found for this champion.")) // Handle nil/empty slice
+		return container.NewCenter(widget.NewLabel("No skin data available for this champion."))
 	}
 
-	foundDisplayableSkins := false
+	displayableSkinCount := 0
 	for _, skin := range skins {
-		// SkinItem handles the IsBase check internally now and returns nil if base
-		item := SkinItem(skin, onSkinSelect)
-		if item != nil { // Only add non-base skins returned by SkinItem
+		// Pass the skin struct directly, SkinItem handles IsBase check
+		item := SkinItem(skin, onSkinSelect) // SkinItem usa la lógica revertida
+		if item != nil {
 			grid.Add(item)
-			foundDisplayableSkins = true
+			displayableSkinCount++
 		}
 	}
 
-	// If only base skins existed, the grid will be empty
-	if !foundDisplayableSkins {
-		// log.Printf("Only base skin found for champion (or skins slice was empty/nil initially).")
-		return container.NewCenter(widget.NewLabel("No alternate skins available."))
+	if displayableSkinCount == 0 {
+		return container.NewCenter(widget.NewLabel("No alternate skins found."))
 	}
 
-	// Add scroll only if there are items in the grid
 	return container.NewScroll(grid)
 }

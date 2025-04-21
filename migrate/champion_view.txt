@@ -1,71 +1,104 @@
+// skinhunter/ui/champion_view.go
 package ui
 
 import (
 	"fmt"
 	"log"
+	"strings"
 
-	"skinhunter/data" // Import your data package
+	"skinhunter/data"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	// Remove unused imports if any
 )
 
-// ACTUALIZADO: NewChampionView acepta ChampionSummary, usa Alias para fetch
-func NewChampionView(champion data.ChampionSummary, onBack func(), onSkinSelect func(skin data.Skin)) fyne.CanvasObject {
-	loadingLabel := widget.NewLabel("Loading champion details...")
-	contentArea := container.NewStack(loadingLabel)
+// NewChampionView creates the view displaying champion details and their skins.
+func NewChampionView(
+	champion data.ChampionSummary,
+	onBack func(),
+	onSkinSelect func(skin data.Skin, allChromas []data.Chroma),
+) fyne.CanvasObject {
+
+	log.Printf("Creating champion view for: %s (ID: %d)", champion.Name, champion.ID)
+	loading := widget.NewProgressBarInfinite()
+	contentArea := container.NewMax(container.NewCenter(loading))
 
 	go func() {
-		// Fetch detailed data usando el Alias del ChampionSummary recibido
-		details, err := data.FetchChampionDetails(champion.Alias) // <-- Usar champion.Alias (string)
+		details, err := data.FetchChampionDetails(champion.ID)
+		var viewContent fyne.CanvasObject
+
 		if err != nil {
-			log.Printf("Error fetching details for %s: %v", champion.Name, err) // Usar champion.Name para el log
-			fyne.CurrentApp().SendNotification(&fyne.Notification{
-				Title:   "Error",
-				Content: fmt.Sprintf("Could not load details for %s", champion.Name), // Usar champion.Name
-			})
+			log.Printf("Error fetching details for %s (ID: %d): %v", champion.Name, champion.ID, err)
 			errorLabel := widget.NewLabel(fmt.Sprintf("Error loading details for %s", champion.Name))
-			// Actualizar UI en hilo principal (implícito por Fyne para widgets)
-			contentArea.Objects = []fyne.CanvasObject{container.NewCenter(errorLabel)}
-			contentArea.Refresh()
-			return
-		}
+			errorLabel.Wrapping = fyne.TextWrapWord
+			viewContent = container.NewCenter(errorLabel)
+		} else {
+			log.Printf("Details fetched successfully for %s", details.Name)
 
-		log.Printf("Details loaded for %s, creating view...", details.Name) // Usar details.Name una vez cargado
+			// Left Side: Champion Info (Icon, Name, Title, Bio)
+			imgSize := float32(80)
+			// *** FIX: NewAsyncImage now returns only the widget ***
+			imgWidget := NewAsyncImage(imgSize, imgSize)
+			imageUrl := data.Asset(details.SquarePortraitPath)
 
-		// --- Build the Champion View UI ---
-		backButton := widget.NewButtonWithIcon("", theme.NavigateBackIcon(), onBack)
+			// *** FIX: Call SetImageURL with correct arguments ***
+			SetImageURL(imgWidget, imageUrl) // Pass widget, url
 
-		// --- Skins Grid ---
-		skinsGrid := container.NewGridWithColumns(3)
-		for _, skin := range details.Skins {
-			if skin.IsBase {
-				continue
+			champNameLabel := widget.NewLabelWithStyle(details.Name, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+			champTitleText := ""
+			if details.Title != "" {
+				champTitleText = strings.Title(strings.ToLower(details.Title))
 			}
-			selectedSkin := skin
-			item := SkinGridItem(selectedSkin, func(s data.Skin) {
-				log.Printf("Skin selected: %s (ID: %d)", s.Name, s.ID)
-				onSkinSelect(s)
+			champTitleLabel := widget.NewLabel(champTitleText)
+			champTitleLabel.Wrapping = fyne.TextWrapWord
+
+			bioLabel := widget.NewLabel(details.ShortBio)
+			bioLabel.Wrapping = fyne.TextWrapWord
+			bioScroll := container.NewScroll(bioLabel)
+			bioScroll.SetMinSize(fyne.NewSize(300, 100))
+
+			champInfoBlock := container.NewVBox(
+				// *** FIX: Use imgWidget directly in the layout ***
+				container.NewHBox(imgWidget, container.NewVBox(champNameLabel, champTitleLabel)),
+				widget.NewSeparator(),
+				bioScroll,
+			)
+
+			// Right Side: Skins Grid
+			skinsTitleLabel := widget.NewLabelWithStyle(fmt.Sprintf("%s Skins", details.Name), fyne.TextAlignCenter, fyne.TextStyle{Bold: true, Italic: false})
+			skinsGrid := NewSkinsGrid(details.Skins, func(skin data.Skin) {
+				log.Printf("Skin selected in ChampionView: %s (ID: %d)", skin.Name, skin.ID)
+				var allChromasForChamp []data.Chroma
+				for _, s := range details.Skins {
+					for _, ch := range s.Chromas {
+						if ch.OriginSkinID == 0 {
+							ch.OriginSkinID = s.ID
+						}
+						allChromasForChamp = append(allChromasForChamp, ch)
+					}
+				}
+				log.Printf("Passing %d total chromas to dialog for champ %s", len(allChromasForChamp), details.Name)
+				onSkinSelect(skin, allChromasForChamp)
 			})
-			if item != nil {
-				skinsGrid.Add(item)
-			}
+
+			skinsArea := container.NewBorder(container.NewPadded(skinsTitleLabel), nil, nil, nil, skinsGrid)
+
+			split := container.NewHSplit(
+				container.NewPadded(champInfoBlock),
+				container.NewPadded(skinsArea),
+			)
+			split.Offset = 0.3
+
+			viewContent = split
+			log.Printf("Champion view UI built for %s", details.Name)
 		}
-		scrollableSkins := container.NewScroll(skinsGrid)
 
-		// --- Final Layout ---
-		championViewContent := container.NewBorder(
-			container.NewHBox(backButton, widget.NewLabel(fmt.Sprintf("%s Skins", details.Name))), // Usar details.Name
-			nil, nil, nil,
-			scrollableSkins,
-		)
-
-		// Actualizar UI en hilo principal (implícito)
-		contentArea.Objects = []fyne.CanvasObject{championViewContent}
+		// Update the Main Content Area (This part should be safe)
+		contentArea.Objects = []fyne.CanvasObject{viewContent}
 		contentArea.Refresh()
-		log.Printf("Champion view refreshed for %s", details.Name)
+		log.Printf("Champion view updated for %s", champion.Name)
 
 	}() // End of goroutine
 

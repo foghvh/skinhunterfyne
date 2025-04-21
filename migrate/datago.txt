@@ -1,371 +1,467 @@
+// skinhunter/data/data.go
 package data
 
 import (
 	"encoding/json"
 	"fmt"
-	"image/color" // Necesario para ParseHexColor
-	"io"
+	"image/color"
 	"log"
 	"net/http"
+	"os"
 	"sort"
-	"strconv" // Necesario para ParseHexColor
+	"strconv"
 	"strings"
 	"sync"
-	"time" // Necesario para timeouts
-
-	"fyne.io/fyne/v2"
-	// No necesitamos canvas aquí ahora
-	"fyne.io/fyne/v2/theme"
+	"time"
+	// Import fyne types only if absolutely necessary here
+	// Removed fyne/v2 and fyne/v2/theme imports as they aren't used directly
 )
 
 const (
-	// Mantenemos ddragon para detalles por ahora, podría cambiarse después
-	dataDragonBase = "https://ddragon.leagueoflegends.com/cdn/"
-	// Nuevas constantes para Community Dragon
-	cDragonBase         = "https://raw.communitydragon.org/latest"
-	cDragonDataBE       = cDragonBase + "/plugins/rcp-be-lol-game-data/global/default"
+	cDragonBase = "https://raw.communitydragon.org/latest"
+	// !! dataRoot should be used for API calls like skins.json, champions.json !!
+	dataRootAPI         = cDragonBase + "/plugins/rcp-be-lol-game-data/global/default"
 	cDragonStaticAssets = cDragonBase + "/plugins/rcp-fe-lol-static-assets/global/default"
-	defaultVersion      = "14.9.1" // Podría volverse menos relevante
+	// !! Base URL for constructing final ASSET URLs from relative paths !!
+	assetURLBase = dataRootAPI // Base for assets IS the plugin default dir
+	// Prefix to remove from JSON paths
+	jsonAssetPathPrefix = "/lol-game-data/assets"
 )
 
 var (
-	championListCache []ChampionSummary // El caché sigue siendo útil
-	championDataCache = make(map[int]DetailedChampionData)
-	skinDataCache     = make(map[int]Skin)
-	chromaDataCache   = make(map[int][]Chroma)
-	cacheMutex        sync.RWMutex
-	appVersion        = defaultVersion
+	httpClient          = &http.Client{Timeout: time.Second * 15} // Shared client
+	championListCache   []ChampionSummary
+	championDetailCache = make(map[int]*DetailedChampionData) // Use Champion ID (int) as key
+	skinLinesCache      []SkinLine
+	cacheMutex          sync.RWMutex
+	cDragonVersion      string
+	allSkinsMap         map[string]Skin // Map skin ID (string) to Skin struct
 )
 
-// --- Structs ---
+var (
+	// ... existing vars ...
+	debugLogger = log.New(os.Stdout, "[DEBUG] ", log.Ltime|log.Lshortfile)
+	// Create a file for image logs
+	imageLogFile, _ = os.OpenFile("c:\\Users\\dev\\buenoche\\image_debug.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	imageLogger     = log.New(imageLogFile, "[IMAGE] ", log.Ltime|log.Lshortfile)
+)
 
-// ACTUALIZADO: ChampionSummary para coincidir con Community Dragon
+// --- Structs --- (Remain the same as previous correct version)
 type ChampionSummary struct {
-	ID                 int      `json:"id"` // Ahora es numérico
+	ID                 int      `json:"id"`
 	Name               string   `json:"name"`
-	Alias              string   `json:"alias"`              // A veces diferente a Name
-	SquarePortraitPath string   `json:"squarePortraitPath"` // Ruta relativa
+	Alias              string   `json:"alias"`
+	SquarePortraitPath string   `json:"squarePortraitPath"`
 	Roles              []string `json:"roles"`
-	// No hay 'Key' (numérico como string) en este JSON, usamos ID directamente
+	Key                string   `json:"key"`
 }
 
-// Mantenemos ChampionListData para DDragon (podría eliminarse si todo migra a CDragon)
-type ChampionListData struct {
-	Type    string                     `json:"type"`
-	Format  string                     `json:"format"`
-	Version string                     `json:"version"`
-	Data    map[string]ChampionSummary // El map key aquí es el Alias ("Aatrox")
+type SkinLine struct {
+	ID   int
+	Name string
 }
 
-// Estructuras detalladas sin cambios por ahora
 type Skin struct {
-	ID          int      `json:"id"`
-	Name        string   `json:"name"`
-	TilePath    string   `json:"tilePath"`
-	SplashPath  string   `json:"splashPath"`
-	Description string   `json:"description"`
-	Rarity      string   `json:"rarity"`
-	IsLegacy    bool     `json:"isLegacy"`
-	IsBase      bool     `json:"isBase"`
-	Chromas     []Chroma `json:"chromas"`
+	ID                   int                `json:"id"`
+	Name                 string             `json:"name"`
+	TilePath             string             `json:"tilePath"`
+	SplashPath           string             `json:"splashPath"`
+	UncenteredSplashPath string             `json:"uncenteredSplashPath"`
+	Description          string             `json:"description"`
+	Rarity               string             `json:"rarityGemPath"`
+	IsLegacy             bool               `json:"isLegacy"`
+	IsBase               bool               `json:"isBase"`
+	Chromas              []Chroma           `json:"chromas"`
+	SkinLines            []struct{ ID int } `json:"skinLines"`
+	LoadScreenPath       string             `json:"loadScreenPath"`
 }
 
 type DetailedChampionData struct {
-	ID                 string `json:"id"`  // Mantenido como string (Nombre/Alias) de DDragon
-	Key                string `json:"key"` // Key numérico como string de DDragon
-	Name               string `json:"name"`
-	Title              string `json:"title"`
-	ShortBio           string `json:"lore"`
-	SquarePortraitPath string `json:"-"` // Construido
-	Skins              []Skin `json:"skins"`
+	ID                 int      `json:"id"`
+	Name               string   `json:"name"`
+	Alias              string   `json:"alias"`
+	Title              string   `json:"title"`
+	ShortBio           string   `json:"shortBio"`
+	SquarePortraitPath string   `json:"squarePortraitPath"`
+	Roles              []string `json:"roles"`
+	Skins              []Skin   `json:"skins"`
 }
 
 type Chroma struct {
-	ID         int      `json:"id"`
-	Name       string   `json:"name"`
-	ChromaPath string   `json:"chromaPath"`
-	Colors     []string `json:"colors"`
-	Origin     int      `json:"-"`
+	ID           int      `json:"id"`
+	Name         string   `json:"name"`
+	ChromaPath   string   `json:"chromaPath"`
+	Colors       []string `json:"colors"`
+	OriginSkinID int      `json:"-"`
 }
 
-// --- Fetching Functions ---
+// --- Initialization and Caching --- (Remain the same)
+func InitData() error {
+	log.Println("Initializing data...")
+	cacheMutex.Lock()
+	defer cacheMutex.Unlock()
+	if len(championListCache) > 0 && len(allSkinsMap) > 0 {
+		// log.Println("Data already initialized.") // Less noise
+		return nil
+	}
+	err := fetchCDragonVersion()
+	if err != nil {
+		log.Printf("WARN: Version fetch fail: %v. Using 'latest'.", err)
+		cDragonVersion = "latest"
+	}
+	champions, err := fetchChampionSummary()
+	if err != nil {
+		return fmt.Errorf("init champs: %w", err)
+	}
+	championListCache = champions
+	log.Printf("Inited %d champs.", len(championListCache))
+	allSkins, err := fetchSkinsJSON()
+	if err != nil {
+		return fmt.Errorf("init skins: %w", err)
+	}
+	allSkinsMap = allSkins
+	log.Printf("Inited %d skins.", len(allSkinsMap))
+	log.Println("Data init OK.")
+	return nil
+}
 
-// ACTUALIZADO: FetchAllChampions para usar Community Dragon
+func fetchCDragonVersion() error {
+	url := fmt.Sprintf("%s/content-metadata.json", cDragonBase)
+	resp, err := httpClient.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("bad version status %s", resp.Status)
+	}
+	var meta struct {
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+		return err
+	}
+	if meta.Version == "" {
+		return fmt.Errorf("empty ver")
+	}
+	cDragonVersion = meta.Version
+	return nil
+}
+
+func fetchChampionSummary() ([]ChampionSummary, error) {
+	url := fmt.Sprintf("%s/v1/champion-summary.json", dataRootAPI)
+	resp, err := httpClient.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("get sum fail %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("sum status %s", resp.Status)
+	}
+	var data []ChampionSummary
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, fmt.Errorf("dec sum fail %w", err)
+	}
+	champs := make([]ChampionSummary, 0, len(data))
+	for _, ch := range data {
+		if ch.ID != -1 {
+			ch.Key = strings.ToLower(ch.Alias)
+			champs = append(champs, ch)
+		}
+	}
+	sort.Slice(champs, func(i, j int) bool { return champs[i].Name < champs[j].Name })
+	return champs, nil
+}
+
 func FetchAllChampions() ([]ChampionSummary, error) {
 	cacheMutex.RLock()
 	if len(championListCache) > 0 {
 		cacheMutex.RUnlock()
-		log.Println("Serving champions from cache")
 		return championListCache, nil
 	}
 	cacheMutex.RUnlock()
+	// log.Println("Champ cache empty, re-init..."); // Optional logging
+	initErr := InitData()
+	if initErr != nil {
+		return nil, fmt.Errorf("re-init fail: %w", initErr)
+	}
+	cacheMutex.RLock()
+	defer cacheMutex.RUnlock()
+	if len(championListCache) == 0 {
+		return nil, fmt.Errorf("still empty")
+	}
+	return championListCache, nil
+}
 
-	log.Println("Fetching all champions from Community Dragon API...")
-	// Nueva URL
-	url := fmt.Sprintf("%s/v1/champion-summary.json", cDragonDataBE)
-	client := &http.Client{Timeout: time.Second * 10}
-	resp, err := client.Get(url)
+func fetchSkinsJSON() (map[string]Skin, error) {
+	url := fmt.Sprintf("%s/v1/skins.json", dataRootAPI)
+	resp, err := httpClient.Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch champion summary from CDragon: %w", err)
+		return nil, fmt.Errorf("get skins fail %w", err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to fetch champion summary from CDragon: status %d - %s", resp.StatusCode, string(bodyBytes))
+		return nil, fmt.Errorf("skins status %s", resp.Status)
 	}
-
-	// El JSON es ahora un array directo de objetos ChampionSummary
-	var data []ChampionSummary
+	var data map[string]Skin
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return nil, fmt.Errorf("failed to decode champion summary JSON from CDragon: %w", err)
+		return nil, fmt.Errorf("dec skins fail %w", err)
 	}
-
-	// Filtrar campeones inválidos (ID < 0) y ordenar
-	champions := make([]ChampionSummary, 0, len(data))
-	for _, champ := range data {
-		if champ.ID >= 0 { // Filtrar IDs negativos si existen
-			champions = append(champions, champ)
+	pData := make(map[string]Skin, len(data))
+	for idStr, s := range data {
+		sID, err := strconv.Atoi(idStr)
+		if err != nil {
+			log.Printf("WARN Bad ID %s %v", idStr, err)
+			continue
 		}
+		s.ID = sID
+		s.IsBase = (sID%1000 == 0)
+		for i := range s.Chromas {
+			s.Chromas[i].OriginSkinID = s.ID
+		}
+		pData[idStr] = s
 	}
-
-	sort.Slice(champions, func(i, j int) bool {
-		return champions[i].Name < champions[j].Name
-	})
-
-	cacheMutex.Lock()
-	championListCache = champions
-	cacheMutex.Unlock()
-	log.Printf("Fetched and cached %d champions from Community Dragon", len(champions))
-
-	return champions, nil
+	return pData, nil
 }
 
-// FetchChampionDetails sigue usando DDragon por ahora (podría migrarse)
-func FetchChampionDetails(championAlias string) (DetailedChampionData, error) {
-	// Nota: Este endpoint de DDragon usa el Alias ("Aatrox") no el ID numérico.
-	log.Printf("Fetching details for champion %s from DDragon API...", championAlias)
-	url := fmt.Sprintf("%s%s/data/en_US/champion/%s.json", dataDragonBase, appVersion, championAlias)
-	// ... (resto de la lógica de FetchChampionDetails sin cambios significativos por ahora)...
-	// ... (se necesitaría mapear entre el ID numérico de CDragon y el Alias de DDragon si se mezclan fuentes)...
-	client := &http.Client{Timeout: time.Second * 10}
-	resp, err := client.Get(url)
+func GetAllSkinsMap() (map[string]Skin, error) {
+	cacheMutex.RLock()
+	defer cacheMutex.RUnlock()
+	if len(allSkinsMap) == 0 {
+		return nil, fmt.Errorf("map NI")
+	}
+	return allSkinsMap, nil
+}
+
+func GetSkinsForChampion(championID int) ([]Skin, error) {
+	cacheMutex.RLock()
+	defer cacheMutex.RUnlock()
+	if len(allSkinsMap) == 0 {
+		return nil, fmt.Errorf("map NI")
+	}
+	skins := make([]Skin, 0)
+	for _, s := range allSkinsMap {
+		if GetChampionIDFromSkinID(s.ID) == championID {
+			for i := range s.Chromas {
+				s.Chromas[i].OriginSkinID = s.ID
+			}
+			skins = append(skins, s)
+		}
+	}
+	sort.Slice(skins, func(i, j int) bool { return skins[i].ID < skins[j].ID })
+	return skins, nil
+}
+
+func GetChampionIDFromSkinID(skinID int) int {
+	if skinID < 1000 {
+		return -1
+	}
+	return skinID / 1000
+}
+
+func FetchChampionDetails(championID int) (*DetailedChampionData, error) {
+	cacheMutex.RLock()
+	if cd, f := championDetailCache[championID]; f {
+		cacheMutex.RUnlock()
+		return cd, nil
+	}
+	cacheMutex.RUnlock()
+	log.Printf("Fetch detail %d...", championID)
+	url := fmt.Sprintf("%s/v1/champions/%d.json", dataRootAPI, championID)
+	resp, err := httpClient.Get(url)
 	if err != nil {
-		return DetailedChampionData{}, fmt.Errorf("failed to fetch details for %s from DDragon: %w", championAlias, err)
+		return nil, fmt.Errorf("get det %d: %w", championID, err)
 	}
 	defer resp.Body.Close()
-
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("champ %d 404", championID)
+	}
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return DetailedChampionData{}, fmt.Errorf("failed to fetch details for %s from DDragon: status %d - %s", championAlias, resp.StatusCode, string(bodyBytes))
+		return nil, fmt.Errorf("det status %d %d", resp.StatusCode, championID)
 	}
-
-	var wrapper map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&wrapper); err != nil {
-		return DetailedChampionData{}, fmt.Errorf("failed to decode details wrapper for %s: %w", championAlias, err)
+	var details DetailedChampionData
+	if err := json.NewDecoder(resp.Body).Decode(&details); err != nil {
+		return nil, fmt.Errorf("dec det %d: %w", championID, err)
 	}
-	dataField, ok := wrapper["data"].(map[string]interface{})
-	if !ok {
-		return DetailedChampionData{}, fmt.Errorf("unexpected DDragon structure: 'data' field not found or not a map for %s", championAlias)
-	}
-	championDataJSON, ok := dataField[championAlias]
-	if !ok {
-		return DetailedChampionData{}, fmt.Errorf("unexpected DDragon structure: champion key '%s' not found in 'data' for %s", championAlias, championAlias)
-	}
-	championBytes, err := json.Marshal(championDataJSON)
-	if err != nil {
-		return DetailedChampionData{}, fmt.Errorf("failed to re-marshal champion data for %s: %w", championAlias, err)
-	}
-
-	var champDetails DetailedChampionData
-	if err := json.Unmarshal(championBytes, &champDetails); err != nil {
-		return DetailedChampionData{}, fmt.Errorf("failed to unmarshal champion details for %s: %w", championAlias, err)
-	}
-
-	// Fetch Chromas Separately if needed (logica existente o a implementar)
-	for i := range champDetails.Skins {
-		for j := range champDetails.Skins[i].Chromas {
-			champDetails.Skins[i].Chromas[j].Origin = champDetails.Skins[i].ID
+	for i := range details.Skins {
+		oID := details.Skins[i].ID
+		details.Skins[i].IsBase = (oID%1000 == 0)
+		for j := range details.Skins[i].Chromas {
+			details.Skins[i].Chromas[j].OriginSkinID = oID
 		}
 	}
-
-	log.Printf("Fetched details for champion %s from DDragon", championAlias)
-	return champDetails, nil
-
+	cacheMutex.Lock()
+	championDetailCache[championID] = &details
+	cacheMutex.Unlock()
+	log.Printf("Fetched details %d (%s)", championID, details.Name)
+	return &details, nil
 }
 
-// --- URL Helper Functions ---
+func GetSkinDetails(skinID int) (Skin, error) {
+	cacheMutex.RLock()
+	idStr := fmt.Sprintf("%d", skinID)
+	cs, f := allSkinsMap[idStr]
+	cacheMutex.RUnlock()
+	if f {
+		for i := range cs.Chromas {
+			cs.Chromas[i].OriginSkinID = skinID
+		}
+		cs.IsBase = (skinID%1000 == 0)
+		return cs, nil
+	}
+	log.Printf("WARN Skin %d map miss...", skinID)
+	cID := GetChampionIDFromSkinID(skinID)
+	if cID <= 0 {
+		return Skin{}, fmt.Errorf("inv champ %d skin %d", cID, skinID)
+	}
+	details, err := FetchChampionDetails(cID)
+	if err != nil {
+		return Skin{}, fmt.Errorf("skin %d map miss, champ %d fail %w", skinID, cID, err)
+	}
+	for _, s := range details.Skins {
+		if s.ID == skinID {
+			log.Printf("Found skin %d in champ %d", skinID, cID)
+			s.IsBase = (skinID%1000 == 0)
+			for i := range s.Chromas {
+				s.Chromas[i].OriginSkinID = skinID
+			}
+			return s, nil
+		}
+	}
+	return Skin{}, fmt.Errorf("skin %d not found", skinID)
+}
 
-// NUEVA: GetChampionSquarePortraitURLFromCDragon
-func GetChampionSquarePortraitURLFromCDragon(champ ChampionSummary) string {
-	// champ.SquarePortraitPath es como "/lol-game-data/assets/v1/champion-icons/1.png"
-	// Necesitamos reemplazar la primera parte con cDragonBase
-	if champ.SquarePortraitPath == "" {
+// --- URL Helper Functions (Corrected Asset) ---
+
+// !! FINAL CORRECTED Asset Function - Implements logic as described by user !!
+// Input `path`: Raw path from JSON (e.g., "/lol-game-data/assets/v1/...")
+func Asset(path string) string {
+	if path == "" {
+		imageLogger.Printf("❌ Empty path received, returning placeholder")
 		return GetPlaceholderImageURL()
 	}
-	// Reemplazar "/lol-game-data/assets" con cDragonBase + "/plugins/rcp-be-lol-game-data/global/default"
-	// ¡OJO! El path en el JSON YA incluye la parte del plugin. Solo necesitamos cDragonBase.
-	// Incorrecto: strings.Replace(champ.SquarePortraitPath, "/lol-game-data/assets", cDragonDataBE, 1)
-	// Correcto: cDragonBase + champ.SquarePortraitPath
-	return cDragonBase + champ.SquarePortraitPath
+
+	imageLogger.Printf("➡️ Input path: '%s'", path)
+
+	if strings.HasPrefix(strings.ToLower(path), jsonAssetPathPrefix) {
+		relativePath := path[len(jsonAssetPathPrefix):]
+		lowerRelativePath := strings.ToLower(relativePath)
+		resultURL := assetURLBase + lowerRelativePath
+
+		imageLogger.Printf("✅ Generated URL: '%s'", resultURL)
+		return resultURL
+	} else {
+		imageLogger.Printf("❌ Invalid path format: '%s' (missing prefix: '%s')", path, jsonAssetPathPrefix)
+		return GetPlaceholderImageURL()
+	}
 }
 
-// GetSkinTileURL sigue usando DDragon (necesitaría cambio si fuente de skins cambia)
+// Get...URL functions call the corrected Asset func
+func GetChampionSquarePortraitURL(champ ChampionSummary) string {
+	imageLogger.Printf("Getting champion portrait for: %s (Path: %s)", champ.Name, champ.SquarePortraitPath)
+	return Asset(champ.SquarePortraitPath)
+}
 func GetSkinTileURL(skin Skin) string {
-	// Lógica actual basada en DDragon y skin ID (ChampKey*1000 + SkinNum)
-	// Esto es frágil y depende de cómo se obtienen los detalles de la skin.
-	// Si FetchChampionDetails sigue viniendo de DDragon, esto podría funcionar aún.
-	champKey := skin.ID / 1000
-	skinNum := skin.ID % 1000
-
-	// Necesitamos mapear el champKey (numérico) al Alias (string) para la URL de DDragon
-	var champAlias string
-	champions, err := FetchAllChampions() // Usa caché
-	if err == nil {
-		for _, c := range champions {
-			if c.ID == champKey { // Comparar con ID numérico de CDragon
-				champAlias = c.Alias // Usar el Alias para DDragon
-				break
-			}
-		}
+	path := skin.TilePath
+	if path == "" {
+		imageLogger.Printf("Skin tile path empty, using LoadScreenPath for skin ID %d", skin.ID)
+		path = skin.LoadScreenPath
 	}
-	if champAlias == "" {
-		log.Printf("Warning: Could not find champion alias for key %d", champKey)
-		return GetPlaceholderImageURL()
-	}
-
-	// URL DDragon: https://ddragon.leagueoflegends.com/cdn/img/champion/loading/Aatrox_1.jpg
-	return fmt.Sprintf("%simg/champion/loading/%s_%d.jpg", dataDragonBase, champAlias, skinNum)
+	imageLogger.Printf("Getting skin tile for ID %d (Path: %s)", skin.ID, path)
+	return Asset(path)
 }
-
-// GetSkinSplashURL sigue usando DDragon (necesitaría cambio si fuente de skins cambia)
 func GetSkinSplashURL(skin Skin) string {
-	// Lógica similar a GetSkinTileURL
-	champKey := skin.ID / 1000
-	skinNum := skin.ID % 1000
-	var champAlias string
-	champions, err := FetchAllChampions() // Usa caché
-	if err == nil {
-		for _, c := range champions {
-			if c.ID == champKey {
-				champAlias = c.Alias
-				break
-			}
+	path := skin.SplashPath
+	if skin.UncenteredSplashPath != "" {
+		imageLogger.Printf("Using uncentered splash for skin ID %d", skin.ID)
+		path = skin.UncenteredSplashPath
+	}
+	imageLogger.Printf("Getting skin splash for ID %d (Path: %s)", skin.ID, path)
+	return Asset(path)
+}
+func GetChromaImageURL(chroma Chroma) string { return Asset(chroma.ChromaPath) }
+
+// --- Remaining helpers --- (No changes needed from working version)
+func KhadaUrl(skinID int, chromaID int) string { /* ... */
+	b := "https://modelviewer.lol/model-viewer?id="
+	if chromaID > 0 && skinID != chromaID && GetChampionIDFromSkinID(skinID) == GetChampionIDFromSkinID(chromaID) {
+		return fmt.Sprintf("%s%d&chroma=%d", b, skinID, chromaID)
+	}
+	return fmt.Sprintf("%s%d", b, skinID)
+}
+func GetPlaceholderImageURL() string { /* ... */
+	return "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+}
+
+var rarityMap = map[string][2]string{ /* ... */ "raritygem_ultimate.png": {"Ultimate", "ultimate.png"}, "raritygem_mythic.png": {"Mythic", "mythic.png"}, "raritygem_legendary.png": {"Legendary", "legendary.png"}, "raritygem_epic.png": {"Epic", "epic.png"}, "raritygem_transcendent.png": {"Transcendent", "transcendent.png"}, "raritygem_exalted.png": {"Exalted", "exalted.png"}}
+
+func Rarity(skin Skin) (string, string) { /* ... */
+	if skin.Rarity == "" {
+		return "", ""
+	}
+	lP := strings.ToLower(skin.Rarity)
+	for sfx, d := range rarityMap {
+		if strings.HasSuffix(lP, sfx) {
+			n := d[0]
+			iF := d[1]
+			iU := fmt.Sprintf("%s/v1/rarity-gem-icons/%s", assetURLBase, iF)
+			return n, iU
 		}
 	}
-	if champAlias == "" {
-		log.Printf("Warning: Could not find champion alias for key %d", champKey)
-		return GetPlaceholderImageURL()
-	}
-	// URL DDragon: https://ddragon.leagueoflegends.com/cdn/img/champion/splash/Aatrox_1.jpg
-	return fmt.Sprintf("%simg/champion/splash/%s_%d.jpg", dataDragonBase, champAlias, skinNum)
+	return "", ""
+} // Used assetURLBase for Rarity Icons too
+func LegacyIconURL() string { /* ... */
+	return fmt.Sprintf("%s/images/summoner-icon/icon-legacy.png", cDragonStaticAssets)
 }
-
-// GetChromaImageURL usa CommunityDragon (como antes)
-func GetChromaImageURL(chroma Chroma) string {
-	if chroma.ChromaPath == "" {
-		return GetPlaceholderImageURL()
-	}
-	// Asume que chroma.ChromaPath es como /lol-game-data/assets/...
-	// Necesita prefijarse con cDragonBase
-	return cDragonBase + strings.ToLower(chroma.ChromaPath)
+func ChromaIconURL() string { /* ... */
+	return fmt.Sprintf("%s/images/skin-viewer/icon-chroma-default.png", cDragonStaticAssets)
 }
-
-// GetPlaceholderImageURL sin cambios
-func GetPlaceholderImageURL() string {
-	return "https://via.placeholder.com/100x100.png?text=Error"
-}
-
-// --- Resource Helpers (Icons etc.) ---
-
-// GetRarityIconResource usa CommunityDragon (como antes)
-func GetRarityIconResource(skin Skin) fyne.Resource {
-	var iconName string
-	switch skin.Rarity {
-	case "kUltimate":
-		iconName = "ultimate.png"
-	case "kMythic":
-		iconName = "mythic.png"
-	case "kLegendary":
-		iconName = "legendary.png"
-	case "kEpic":
-		iconName = "epic.png"
-	default:
-		return nil
+func ParseHexColor(s string) (color.NRGBA, error) { /* ... */
+	if s == "" {
+		return color.NRGBA{128, 128, 128, 255}, fmt.Errorf("empty")
 	}
-	url := fmt.Sprintf("%s/v1/rarity-gem-icons/%s", cDragonDataBE, iconName)
-	res, err := fyne.LoadResourceFromURLString(url) // Cambiado a URLString
-	if err != nil {
-		log.Printf("Failed to load rarity icon %s: %v", url, err)
-		return theme.ErrorIcon()
-	}
-	return res
-}
-
-// GetLegacyIconResource usa CommunityDragon (como antes)
-func GetLegacyIconResource() fyne.Resource {
-	url := fmt.Sprintf("%s/images/summoner-icon/icon-legacy.png", cDragonStaticAssets)
-	res, err := fyne.LoadResourceFromURLString(url) // Cambiado a URLString
-	if err != nil {
-		log.Printf("Failed to load legacy icon %s: %v", url, err)
-		return theme.WarningIcon()
-	}
-	return res
-}
-
-// GetChromaIconResource usa CommunityDragon (como antes)
-func GetChromaIconResource() fyne.Resource {
-	url := fmt.Sprintf("%s/images/skin-viewer/icon-chroma-default.png", cDragonStaticAssets)
-	res, err := fyne.LoadResourceFromURLString(url) // Cambiado a URLString
-	if err != nil {
-		log.Printf("Failed to load chroma icon %s: %v", url, err)
-		return theme.InfoIcon()
-	}
-	return res
-}
-
-// ParseHexColor sin cambios
-func ParseHexColor(s string) (color.NRGBA, error) {
 	if strings.HasPrefix(s, "#") {
 		s = s[1:]
 	}
-	c := color.NRGBA{R: 0, G: 0, B: 0, A: 255}
+	c := color.NRGBA{A: 255}
+	var r, g, b uint64
 	var err error
-	var r, g, b, a uint64
 	switch len(s) {
 	case 6:
 		r, err = strconv.ParseUint(s[0:2], 16, 8)
-		if err != nil {
-			return c, fmt.Errorf("invalid hex: %w", err)
+		if err == nil {
+			g, err = strconv.ParseUint(s[2:4], 16, 8)
 		}
-		g, err = strconv.ParseUint(s[2:4], 16, 8)
-		if err != nil {
-			return c, fmt.Errorf("invalid hex: %w", err)
+		if err == nil {
+			b, err = strconv.ParseUint(s[4:6], 16, 8)
 		}
-		b, err = strconv.ParseUint(s[4:6], 16, 8)
-		if err != nil {
-			return c, fmt.Errorf("invalid hex: %w", err)
+	case 3:
+		r, err = strconv.ParseUint(s[0:1]+s[0:1], 16, 8)
+		if err == nil {
+			g, err = strconv.ParseUint(s[1:2]+s[1:2], 16, 8)
+		}
+		if err == nil {
+			b, err = strconv.ParseUint(s[2:3]+s[2:3], 16, 8)
 		}
 	case 8:
 		r, err = strconv.ParseUint(s[0:2], 16, 8)
-		if err != nil {
-			return c, fmt.Errorf("invalid hex: %w", err)
+		if err == nil {
+			g, err = strconv.ParseUint(s[2:4], 16, 8)
 		}
-		g, err = strconv.ParseUint(s[2:4], 16, 8)
-		if err != nil {
-			return c, fmt.Errorf("invalid hex: %w", err)
+		if err == nil {
+			b, err = strconv.ParseUint(s[4:6], 16, 8)
 		}
-		b, err = strconv.ParseUint(s[4:6], 16, 8)
-		if err != nil {
-			return c, fmt.Errorf("invalid hex: %w", err)
+		var a uint64
+		if err == nil {
+			a, err = strconv.ParseUint(s[6:8], 16, 8)
+			c.A = uint8(a)
 		}
-		a, err = strconv.ParseUint(s[6:8], 16, 8)
-		if err != nil {
-			return c, fmt.Errorf("invalid hex: %w", err)
-		}
-		c.A = uint8(a)
 	default:
-		return c, fmt.Errorf("invalid hex length: %d", len(s))
+		err = fmt.Errorf("len %d", len(s))
+	}
+	if err != nil {
+		log.Printf("WARN Parse hex '%s': %v", s, err)
+		return color.NRGBA{128, 128, 128, 255}, err
 	}
 	c.R = uint8(r)
 	c.G = uint8(g)
