@@ -2,15 +2,14 @@
 package ui
 
 import (
-	"image/color"
+	"image/color" // Necesario para el color de fondo de la barra
 	"log"
-	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/driver/desktop"
-	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/layout" // Necesario para layout.NewSpacer
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
@@ -18,86 +17,58 @@ import (
 	"skinhunter/data"
 )
 
-// ChampionGridItem: Usa la lógica del ejemplo simple.
-const cdragonBase = "https://raw.communitydragon.org/latest"
-
-func ChampionGridItem(champ data.ChampionSummary, onSelect func(champ data.ChampionSummary)) fyne.CanvasObject {
-	// log.Println("WARN: ChampionGridItem called directly, NewChampionGrid uses GridWrap now.") // Quitado warning redundante
-	imgMinSize := fyne.NewSize(80, 80)
-	var imageWidget fyne.CanvasObject
-
-	rawPath := champ.SquarePortraitPath
-	if rawPath == "" {
-		placeholderIcon := widget.NewIcon(theme.BrokenImageIcon())
-		imageWidget = container.NewStack(container.NewCenter(placeholderIcon))
-	} else {
-		fixedPath := cdragonBase + strings.Replace(rawPath, "/lol-game-data/assets", "/plugins/rcp-be-lol-game-data/global/default", 1)
-		uri, err := storage.ParseURI(fixedPath)
-		if err != nil {
-			placeholderIcon := widget.NewIcon(theme.BrokenImageIcon())
-			imageWidget = container.NewStack(container.NewCenter(placeholderIcon))
-		} else {
-			img := canvas.NewImageFromURI(uri)
-			img.FillMode = canvas.ImageFillContain
-			img.SetMinSize(imgMinSize)
-			imageWidget = img
-		}
-	}
-	nameLabel := widget.NewLabel(champ.Name)
-	nameLabel.Alignment = fyne.TextAlignCenter
-	nameLabel.TextStyle = fyne.TextStyle{Bold: true}
-	nameLabel.Truncation = fyne.TextTruncateEllipsis
-	itemContent := container.NewVBox(imageWidget, container.NewPadded(nameLabel))
-	card := widget.NewCard("", "", itemContent)
-	tapButton := widget.NewButton("", func() { onSelect(champ) })
-	stack := container.NewStack(card, tapButton)
-	return stack
-}
-
-// SkinItem: Usa data.Asset + NewImageFromURI.
+// SkinItem: Versión revisada para parecerse a la referencia (imagen Irelia)
 func SkinItem(skin data.Skin, onSelect func(skin data.Skin)) fyne.CanvasObject {
 	if skin.IsBase {
-		return nil
+		return nil // No mostrar skins base
 	}
 
-	itemWidth := float32(190)
-	itemHeight := float32(240)
-	imgHeight := itemHeight * 0.75
-	imgSize := fyne.NewSize(itemWidth, imgHeight)
-	// itemTotalSize := fyne.NewSize(itemWidth, itemHeight) // Comentado
+	// --- Sizing (Ajustar para un look tipo tarjeta/tile ~4:3 o similar) ---
+	itemWidth := float32(350)                     // Ancho similar al anterior
+	imgHeight := float32(350)                     // Altura mayor para mejor proporción
+	imgSize := fyne.NewSize(itemWidth, imgHeight) // Tamaño del área de la imagen
+	iconSize := fyne.NewSize(18, 18)              // Iconos pequeños en overlay
 
-	var finalImgWidget fyne.CanvasObject
-	var rarityIconWidget fyne.CanvasObject = layout.NewSpacer()
-	var topIcons = []fyne.CanvasObject{}
-	iconSize := fyne.NewSize(20, 20)
+	var imageWidget fyne.CanvasObject
+	var rarityIconWidget fyne.CanvasObject = layout.NewSpacer() // Placeholder si no hay icono
+	topIcons := []fyne.CanvasObject{}                           // Slice para iconos superiores (legado, chroma)
 
+	// --- Carga de Imagen (Tile o Fallback) ---
 	imgURL := data.GetSkinTileURL(skin)
 	uri, err := storage.ParseURI(imgURL)
-	if err != nil {
-		log.Printf("Error parsing skin tile URI [%s]: %v", imgURL, err)
+
+	if err != nil || imgURL == data.GetPlaceholderImageURL() {
+		// Placeholder si hay error o URL vacía/placeholder
+		log.Printf("WARN: Placeholder/Error for skin tile %s (ID: %d) URL [%s]: %v", skin.Name, skin.ID, imgURL, err)
 		placeholderRect := canvas.NewRectangle(theme.InputBorderColor())
 		placeholderRect.SetMinSize(imgSize)
-		finalImgWidget = placeholderRect
+		placeholderIcon := widget.NewIcon(theme.BrokenImageIcon())
+		imageWidget = container.NewStack(placeholderRect, container.NewCenter(placeholderIcon))
+		imageWidget.Refresh()
 	} else {
-		imgWidget := canvas.NewImageFromURI(uri)
-		imgWidget.FillMode = canvas.ImageFillStretch
-		imgWidget.SetMinSize(imgSize)
-		finalImgWidget = imgWidget
+		img := canvas.NewImageFromURI(uri)
+		// *** CLAVE: Usar Contain para mantener el aspect ratio ***
+		img.FillMode = canvas.ImageFillContain
+		img.SetMinSize(imgSize)
+		imageWidget = img
 	}
 
-	_, rarityIconURL := data.Rarity(skin)
-	if rarityIconURL != "" {
+	// --- Icono de Rareza ---
+	_, rarityIconURL := data.Rarity(skin) // Obtiene URL del icono de rareza
+	if rarityIconURL != "" && rarityIconURL != data.GetPlaceholderImageURL() {
 		rarityUri, err := storage.ParseURI(rarityIconURL)
 		if err == nil {
 			rarityIcon := canvas.NewImageFromURI(rarityUri)
+			// Ajustar tamaño del icono de rareza si es necesario
 			rarityIcon.SetMinSize(fyne.NewSize(16, 16))
 			rarityIcon.FillMode = canvas.ImageFillContain
-			rarityIconWidget = rarityIcon
+			rarityIconWidget = rarityIcon // Asignar al widget
 		} else {
-			log.Printf("Error parsing rarity icon URI %s: %v", rarityIconURL, err)
+			log.Printf("WARN: Error parsing rarity icon URI %s: %v", rarityIconURL, err)
 		}
 	}
 
+	// --- Iconos Superiores (Legado y Chroma) ---
 	if skin.IsLegacy {
 		legacyURL := data.LegacyIconURL()
 		legacyUri, err := storage.ParseURI(legacyURL)
@@ -107,7 +78,7 @@ func SkinItem(skin data.Skin, onSelect func(skin data.Skin)) fyne.CanvasObject {
 			legacyIcon.FillMode = canvas.ImageFillContain
 			topIcons = append(topIcons, legacyIcon)
 		} else {
-			log.Printf("Error parsing legacy icon URI: %v", err)
+			log.Printf("WARN: Error parsing legacy icon URI: %v", err)
 		}
 	}
 	if len(skin.Chromas) > 0 {
@@ -117,36 +88,64 @@ func SkinItem(skin data.Skin, onSelect func(skin data.Skin)) fyne.CanvasObject {
 			chromaIcon := canvas.NewImageFromURI(chromaUri)
 			chromaIcon.SetMinSize(iconSize)
 			chromaIcon.FillMode = canvas.ImageFillContain
+			// Añadir espacio si ya hay otro icono
 			if len(topIcons) > 0 {
-				spacerRect := canvas.NewRectangle(color.Transparent)
-				spacerRect.SetMinSize(fyne.NewSize(5, 1))
-				topIcons = append(topIcons, spacerRect)
+				topIcons = append(topIcons, layout.NewSpacer()) // O un rect transparente pequeño
 			}
 			topIcons = append(topIcons, chromaIcon)
 		} else {
-			log.Printf("Error parsing chroma icon URI: %v", err)
+			log.Printf("WARN: Error parsing chroma icon URI: %v", err)
 		}
 	}
+	// Contenedor para los iconos superiores, alineados a la derecha
+	topIconsContainer := container.NewHBox(layout.NewSpacer()) // Empuja a la derecha
+	if len(topIcons) > 0 {
+		topIconsContainer.Add(container.NewHBox(topIcons...)) // Añade los iconos existentes
+	}
 
+	// --- Barra Inferior (Nombre y Rareza) ---
 	nameLabel := widget.NewLabel(skin.Name)
 	nameLabel.Truncation = fyne.TextTruncateEllipsis
 	nameLabel.Wrapping = fyne.TextWrapOff
-	bottomContent := container.NewBorder(nil, nil, rarityIconWidget, nil, container.NewPadded(nameLabel))
-	bgRect := canvas.NewRectangle(color.NRGBA{R: 0x0A, G: 0x0E, B: 0x19, A: 0xD0})
-	bottomBar := container.NewStack(bgRect, bottomContent)
-	topIconsHBox := container.NewHBox(layout.NewSpacer(), container.NewHBox(topIcons...))
-	contentLayout := container.NewBorder(container.NewPadded(topIconsHBox), bottomBar, nil, nil, finalImgWidget)
-	card := widget.NewCard("", "", contentLayout)
-	tapButton := widget.NewButton("", func() { onSelect(skin) })
-	finalItem := container.NewStack(card, tapButton)
+	// Layout para nombre y rareza: Rareza a la izquierda, Nombre en el centro (con padding)
+	bottomBarContent := container.NewBorder(
+		nil, nil, // Top, Bottom
+		rarityIconWidget,               // Left (Icono de rareza)
+		nil,                            // Right
+		container.NewPadded(nameLabel), // Center (Nombre con padding)
+	)
+	// Fondo semi-transparente para la barra
+	// Usar un color del tema o definir uno custom
+	// bottomBgColor := theme.HoverBackgroundColor() // Ejemplo usando color del tema
+	bottomBgColor := color.NRGBA{R: 0x10, G: 0x10, B: 0x15, A: 0xD0} // Negro/gris oscuro translúcido
+	bottomBgRect := canvas.NewRectangle(bottomBgColor)
+	// Stack para poner el contenido sobre el fondo
+	bottomBar := container.NewStack(bottomBgRect, bottomBarContent)
 
-	// *** FIX: ELIMINAR SetMinSize en finalItem ***
-	// finalItem.SetMinSize(itemTotalSize)
+	// --- Ensamblaje dentro del Card con Border Layout ---
+	cardContentLayout := container.NewBorder(
+		container.NewPadded(topIconsContainer), // Top: Iconos superiores con padding
+		bottomBar,                              // Bottom: Barra con nombre y rareza
+		nil,                                    // Left: nil
+		nil,                                    // Right: nil
+		imageWidget,                            // Center: La imagen principal
+	)
 
-	return finalItem
+	// --- Crear el Card y el Tappable ---
+	// Usar Card para el fondo y estructura visual
+	card := widget.NewCard("", "", cardContentLayout) // Sin título/subtítulo en el Card
+
+	// Envolver en TappableCard para la interacción
+	tappableItem := NewTappableCard(card, func() {
+		onSelect(skin)
+	})
+
+	return tappableItem
 }
 
-// --- Helpers sin cambios ---
+// --- Helpers (Asegúrate que NewTappableCard y NewTabButton estén aquí) ---
+
+// TappableCard makes any canvas object tappable.
 type TappableCard struct {
 	widget.BaseWidget
 	content  fyne.CanvasObject
@@ -159,6 +158,9 @@ func NewTappableCard(content fyne.CanvasObject, onTap func()) *TappableCard {
 	return c
 }
 func (c *TappableCard) CreateRenderer() fyne.WidgetRenderer {
+	// Devolver un renderer simple que solo dibuja el contenido
+	// Esto evita el padding/fondo por defecto del renderer de Card si envolvieses un Card
+	// ¡PERO! aquí el contenido YA es un Card, así que esto está bien.
 	return widget.NewSimpleRenderer(c.content)
 }
 func (c *TappableCard) Tapped(_ *fyne.PointEvent) {
@@ -167,9 +169,14 @@ func (c *TappableCard) Tapped(_ *fyne.PointEvent) {
 	}
 }
 func (c *TappableCard) Cursor() desktop.Cursor { return desktop.PointerCursor }
+
+// NewIconButton crea un botón con solo un icono.
 func NewIconButton(iconRes fyne.Resource, onTap func()) *widget.Button {
-	return widget.NewButtonWithIcon("", iconRes, onTap)
+	btn := widget.NewButtonWithIcon("", iconRes, onTap)
+	return btn
 }
+
+// NewTabButton crea un vertical button con icono y label.
 func NewTabButton(label string, icon fyne.Resource, tapped func()) fyne.CanvasObject {
 	btnIcon := canvas.NewImageFromResource(icon)
 	btnIcon.SetMinSize(fyne.NewSize(24, 24))

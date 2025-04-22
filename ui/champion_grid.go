@@ -2,9 +2,7 @@
 package ui
 
 import (
-	"image/color" // Necesario para color Transparente
 	"log"
-	"strings"
 
 	"skinhunter/data"
 
@@ -14,81 +12,77 @@ import (
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-	// layout no es estrictamente necesario aquí ahora
 )
 
-// NewChampionGrid: Prueba con Stack + Rectangle Transparente
+// NewChampionGrid crea la vista de cuadrícula de campeones CENTRADA y responsive.
 func NewChampionGrid(onChampionSelect func(champ data.ChampionSummary)) fyne.CanvasObject {
-	const cdragonBase = "https://raw.communitydragon.org/latest"
-	log.Println("Creating Champion Grid (Sync Fetch, Testing Stack + Rect)...")
+	log.Println("Creating Centered Champion Grid (Async Load)...")
+	gridContainer := container.NewMax()
+	loadingIndicator := container.NewCenter(container.NewVBox(widget.NewLabel("Loading Champions..."), widget.NewProgressBarInfinite()))
+	gridContainer.Add(loadingIndicator)
 
-	champions, err := data.FetchAllChampions()
-	// ... (manejo de error y lista vacía igual que antes) ...
-	if err != nil { /* ... */
-		return container.NewCenter(widget.NewLabel("..."))
-	}
-	if len(champions) == 0 { /* ... */
-		return container.NewCenter(widget.NewLabel("..."))
-	}
+	go func() {
+		champions, err := data.FetchAllChampions()
+		var finalContent fyne.CanvasObject
 
-	log.Printf("Building grid with Stack + Rect for %d champions...", len(champions))
-	var championWidgets []fyne.CanvasObject
-	imgTargetSize := fyne.NewSize(80, 80)
-	cellSize := fyne.NewSize(100, 130)
+		if err != nil { /* manejo error */
+			log.Printf("ERROR: ...")
+			finalContent = container.NewCenter(widget.NewLabel("..."))
+		} else if len(champions) == 0 { /* manejo vacío */
+			log.Println("WARN: ...")
+			finalContent = container.NewCenter(widget.NewLabel("..."))
+		} else {
+			log.Printf("Building centered grid UI for %d champions...", len(champions))
+			championWidgets := make([]fyne.CanvasObject, 0, len(champions))
 
-	for _, champ := range champions {
-		var imageWidget fyne.CanvasObject
+			cellWidth := float32(115)
+			cellHeight := float32(135)
+			cellSize := fyne.NewSize(cellWidth, cellHeight)
+			imgTargetSize := fyne.NewSize(80, 80)
 
-		// ... (lógica para crear imageWidget con NewImageFromURI o placeholder, igual que antes) ...
-		rawPath := champ.SquarePortraitPath
-		if rawPath == "" { /* ... placeholder ... */
-			placeholderIcon := widget.NewIcon(theme.BrokenImageIcon())
-			placeholderCont := container.NewStack()
-			placeholderRect := canvas.NewRectangle(theme.InputBorderColor())
-			placeholderRect.SetMinSize(imgTargetSize)
-			placeholderCont.Add(placeholderRect)
-			placeholderCont.Add(container.NewCenter(placeholderIcon))
-			imageWidget = placeholderCont
-		} else { /* ... construir URL y cargar imagen ... */
-			fixedPath := cdragonBase + strings.Replace(rawPath, "/lol-game-data/assets", "/plugins/rcp-be-lol-game-data/global/default", 1)
-			uri, err := storage.ParseURI(fixedPath)
-			if err != nil { /* ... placeholder error ... */
-				placeholderIcon := widget.NewIcon(theme.ErrorIcon())
-				placeholderCont := container.NewStack()
-				placeholderRect := canvas.NewRectangle(theme.ErrorColor())
-				placeholderRect.SetMinSize(imgTargetSize)
-				placeholderCont.Add(placeholderRect)
-				placeholderCont.Add(container.NewCenter(placeholderIcon))
-				imageWidget = placeholderCont
-			} else { /* ... cargar imagen ... */
-				img := canvas.NewImageFromURI(uri)
-				img.FillMode = canvas.ImageFillContain
-				img.SetMinSize(imgTargetSize)
-				imageWidget = img
+			for _, champ := range champions {
+				// ... (creación de imageWidget, nameLabel, itemContent, tappableCard) ...
+				var imageWidget fyne.CanvasObject
+				imageURL := data.GetChampionSquarePortraitURL(champ)
+				uri, parseErr := storage.ParseURI(imageURL)
+				if parseErr != nil || imageURL == data.GetPlaceholderImageURL() {
+					placeholderIcon := widget.NewIcon(theme.BrokenImageIcon())
+					placeholderRect := canvas.NewRectangle(theme.InputBorderColor())
+					placeholderRect.SetMinSize(imgTargetSize)
+					imageWidget = container.NewStack(placeholderRect, container.NewCenter(placeholderIcon))
+					imageWidget.Refresh()
+				} else {
+					img := canvas.NewImageFromURI(uri)
+					img.FillMode = canvas.ImageFillContain
+					img.SetMinSize(imgTargetSize)
+					imageWidget = img
+				}
+				nameLabel := widget.NewLabel(champ.Name)
+				nameLabel.Alignment = fyne.TextAlignCenter
+				nameLabel.Truncation = fyne.TextTruncateEllipsis
+				itemContent := container.NewVBox(container.NewCenter(imageWidget), nameLabel)
+				champCopy := champ
+				tappableCard := NewTappableCard(itemContent, func() { log.Printf("..."); onChampionSelect(champCopy) })
+				championWidgets = append(championWidgets, tappableCard)
 			}
+
+			// *** Usar el CONTENEDOR con LAYOUT PERSONALIZADO ***
+			grid := NewCenteredGridWrap(cellSize, championWidgets...)
+
+			// Envolver directamente en Scroll
+			scrollContainer := container.NewScroll(grid)
+			finalContent = scrollContainer
+			log.Printf("Centered champion grid UI built and ready.")
 		}
 
-		// --- Crear VBox con imagen y nombre (igual que antes) ---
-		nameLabel := widget.NewLabel(champ.Name)
-		nameLabel.Alignment = fyne.TextAlignCenter
-		nameLabel.Truncation = fyne.TextTruncateEllipsis
-		itemContent := container.NewVBox(imageWidget, nameLabel)
-
-		// *** CAMBIO: Usar Rectangle transparente en lugar de Button ***
-		overlayRect := canvas.NewRectangle(color.Transparent)
-		// Añadir un Tapped handler al rectángulo (requiere un widget custom o manejar eventos de forma diferente)
-		// Para simplificar la prueba, de momento no tendrá click.
-		// Si esto funciona, podemos hacer un widget TappableRectangle.
-
-		// *** Usar Stack con itemContent y overlayRect ***
-		itemWidget := container.NewStack(itemContent, overlayRect) // Rectángulo encima
-
-		championWidgets = append(championWidgets, itemWidget)
-	}
-
-	grid := container.NewGridWrap(cellSize, championWidgets...)
-	scrollContainer := container.NewScroll(grid)
-	log.Printf("Grid built with Stack + Rect. Check if images load.", len(championWidgets))
-
-	return scrollContainer
+		// Actualizar UI directamente
+		if gridContainer != nil {
+			gridContainer.Objects = []fyne.CanvasObject{finalContent}
+			gridContainer.Refresh()
+			log.Printf("Champion grid container updated with final content.")
+		} else {
+			log.Println("ERROR: gridContainer is nil...")
+		}
+	}()
+	return gridContainer
 }

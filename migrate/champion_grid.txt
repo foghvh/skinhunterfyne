@@ -2,46 +2,98 @@
 package ui
 
 import (
-	"fmt"
+	// Necesario para color Transparente
 	"log"
+	"strings"
 
 	"skinhunter/data"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/storage"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	// layout no es estrictamente necesario aquí ahora
 )
 
-// NewChampionGrid creates the scrollable grid of champions.
+// NewChampionGrid: Prueba con Stack + Rectangle Transparente
 func NewChampionGrid(onChampionSelect func(champ data.ChampionSummary)) fyne.CanvasObject {
-	contentArea := container.NewMax()
-	loading := widget.NewProgressBarInfinite()
-	contentArea.Add(container.NewCenter(loading))
+	const cdragonBase = "https://raw.communitydragon.org/latest"
+	log.Println("Creating Champion Grid (Sync Fetch, Testing Stack + Rect)...")
 
-	go func() {
-		champions, err := data.FetchAllChampions()
-		if err != nil {
-			log.Printf("Error fetching champions: %v", err)
-			errorLabel := widget.NewLabel(fmt.Sprintf("Error loading champions:\n%v", err))
-			errorLabel.Wrapping = fyne.TextWrapWord
-			contentArea.Objects = []fyne.CanvasObject{container.NewCenter(errorLabel)}
-			contentArea.Refresh()
-			return
-		}
+	champions, err := data.FetchAllChampions()
+	// ... (manejo de error y lista vacía igual que antes) ...
+	if err != nil { /* ... */
+		return container.NewCenter(widget.NewLabel("..."))
+	}
+	if len(champions) == 0 { /* ... */
+		return container.NewCenter(widget.NewLabel("..."))
+	}
 
-		grid := container.NewGridWithColumns(9)
-		for _, champ := range champions {
-			item := ChampionGridItem(champ, onChampionSelect)
-			if item != nil {
-				grid.Add(item)
+	log.Printf("Building grid with Stack + Rect for %d champions...", len(champions))
+	var championWidgets []fyne.CanvasObject
+	imgTargetSize := fyne.NewSize(80, 80)
+	cellSize := fyne.NewSize(100, 130)
+
+	for _, champ := range champions {
+		var imageWidget fyne.CanvasObject
+
+		// ... (lógica para crear imageWidget con NewImageFromURI o placeholder, igual que antes) ...
+		rawPath := champ.SquarePortraitPath
+		if rawPath == "" { /* ... placeholder ... */
+			placeholderIcon := widget.NewIcon(theme.BrokenImageIcon())
+			placeholderCont := container.NewStack()
+			placeholderRect := canvas.NewRectangle(theme.InputBorderColor())
+			placeholderRect.SetMinSize(imgTargetSize)
+			placeholderCont.Add(placeholderRect)
+			placeholderCont.Add(container.NewCenter(placeholderIcon))
+			imageWidget = placeholderCont
+		} else { /* ... construir URL y cargar imagen ... */
+			fixedPath := cdragonBase + strings.Replace(rawPath, "/lol-game-data/assets", "/plugins/rcp-be-lol-game-data/global/default", 1)
+			uri, err := storage.ParseURI(fixedPath)
+			if err != nil { /* ... placeholder error ... */
+				placeholderIcon := widget.NewIcon(theme.ErrorIcon())
+				placeholderCont := container.NewStack()
+				placeholderRect := canvas.NewRectangle(theme.ErrorColor())
+				placeholderRect.SetMinSize(imgTargetSize)
+				placeholderCont.Add(placeholderRect)
+				placeholderCont.Add(container.NewCenter(placeholderIcon))
+				imageWidget = placeholderCont
+			} else { /* ... cargar imagen ... */
+				img := canvas.NewImageFromURI(uri)
+				img.FillMode = canvas.ImageFillContain
+				img.SetMinSize(imgTargetSize)
+				imageWidget = img
 			}
 		}
 
-		scrollContainer := container.NewScroll(grid)
-		contentArea.Objects = []fyne.CanvasObject{scrollContainer}
-		contentArea.Refresh()
-		log.Println("Champion grid UI updated")
-	}()
+		// --- Crear VBox con imagen y nombre (igual que antes) ---
+		nameLabel := widget.NewLabel(champ.Name)
+		nameLabel.Alignment = fyne.TextAlignCenter
+		nameLabel.Truncation = fyne.TextTruncateEllipsis
+		itemContent := container.NewVBox(imageWidget, nameLabel)
 
-	return contentArea
+		// *** CAMBIO: Usar Rectangle transparente en lugar de Button ***
+
+		// Añadir un Tapped handler al rectángulo (requiere un widget custom o manejar eventos de forma diferente)
+		// Para simplificar la prueba, de momento no tendrá click.
+		// Si esto funciona, podemos hacer un widget TappableRectangle.
+		champCopy := champ // Crear una copia para evitar problemas con closures
+
+		// *** Usar Stack con itemContent y overlayRect ***
+
+		tappableCard := NewTappableCard(itemContent, func() {
+			log.Printf("Champion selected: %s (ID: %d)", champCopy.Name, champCopy.ID)
+			onChampionSelect(champCopy)
+		})
+
+		championWidgets = append(championWidgets, tappableCard)
+	}
+
+	grid := container.NewGridWrap(cellSize, championWidgets...)
+	scrollContainer := container.NewScroll(grid)
+	log.Printf("Grid built with Stack + Rect. Check if images load.", len(championWidgets))
+
+	return scrollContainer
 }
