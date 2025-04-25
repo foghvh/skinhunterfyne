@@ -3,12 +3,11 @@ package main
 
 import (
 	"fmt"
-	"image/color"
-	"log"
-	"strings"
+	"log" // For basic setup if needed
+	"sync"
 
 	"skinhunter/data"
-	"skinhunter/ui" // Import local ui package
+	"skinhunter/ui"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -19,11 +18,12 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	// Standard image formats
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
-
-	_ "golang.org/x/image/webp"
+	// Optional: WebP support (requires CGO, ensure setup if used)
+	// _ "golang.org/x/image/webp" // Uncomment if WEBP support is needed and CGO is enabled
 )
 
 const appName = "Skin Hunter Fyne"
@@ -32,282 +32,380 @@ type skinHunterApp struct {
 	fyneApp fyne.App
 	window  fyne.Window
 
-	header          fyne.CanvasObject
-	footer          fyne.CanvasObject
-	leftNav         *fyne.Container
-	rightNav        *fyne.Container
-	centerContent   *fyne.Container
-	background      fyne.CanvasObject
-	navBackButton   fyne.Widget
-	navToggleButton fyne.Widget
+	headerContent *fyne.Container // Container for dynamic header elements
+	headerMutex   sync.Mutex      // Mutex for safe header updates
+	footer        fyne.CanvasObject
+	centerContent *fyne.Container   // Main content area (Max layout)
+	background    fyne.CanvasObject // Background layer
+	navBackButton *widget.Button    // Back button for navigation
 
-	statusLabel      *widget.Label
-	currentView      string
-	selectedChampion data.ChampionSummary
-	isDetailView     bool
+	// State tracking
+	statusLabel      *widget.Label        // For internal status/debug
+	currentView      string               // Name of the current view
+	selectedChampion data.ChampionSummary // Champion for detail view
+	isDetailView     bool                 // Flag for detail view context
 }
 
 func main() {
+	// Basic setup (e.g., environment variables, logging config)
+	// Example: Set Fyne theme (optional, default is usually light)
+	// os.Setenv("FYNE_THEME", "dark")
+
 	shApp := &skinHunterApp{
-		currentView:   "loading",
-		centerContent: container.NewMax(),
+		currentView:   "loading",          // Start in loading state
+		centerContent: container.NewMax(), // Use Max layout for central content switching
 	}
 
 	shApp.fyneApp = app.New()
+	// Optional: Set App ID for packaging/desktop integration
+	// shApp.fyneApp.SetAppID("com.example.skinhunter")
+
 	shApp.window = shApp.fyneApp.NewWindow(appName)
-	shApp.window.Resize(fyne.NewSize(1150, 800))
+	shApp.window.Resize(fyne.NewSize(950, 720)) // Adjusted size
 	shApp.window.CenterOnScreen()
 	shApp.window.SetMainMenu(fyne.NewMainMenu(
 		fyne.NewMenu("File", fyne.NewMenuItem("Quit", func() { shApp.fyneApp.Quit() })),
+		// Add other menus (View, Help) if needed
 	))
 
-	shApp.header = shApp.createHeader()
+	// --- Create UI Components ---
+	shApp.headerContent = container.NewHBox() // HBox for header items (back button, title, spacer)
+	header := shApp.createHeaderContainer(shApp.headerContent)
 	shApp.footer = shApp.createFooter()
-	shApp.leftNav = shApp.createLeftNav()
-	shApp.rightNav = shApp.createRightNav()
+	shApp.navBackButton = widget.NewButtonWithIcon("", theme.NavigateBackIcon(), func() {
+		shApp.goBack()
+	})
+	shApp.navBackButton.Hide() // Start hidden
 
-	bgColor := color.NRGBA{R: 0x0f, G: 0x17, B: 0x29, A: 0xff}
+	// Status label (primarily for debugging or future use)
+	shApp.statusLabel = widget.NewLabel("Initializing...")
+
+	// Background color
+	// bgColor := color.NRGBA{R: 0x1e, G: 0x1e, B: 0x24, A: 0xff} // Dark Gray/Blue
+	bgColor := theme.BackgroundColor() // Use theme background color for consistency
 	shApp.background = canvas.NewRectangle(bgColor)
 
-	contentWithNav := container.NewBorder(nil, nil, shApp.leftNav, shApp.rightNav, shApp.centerContent)
-	layeredContent := container.NewStack(shApp.background, contentWithNav)
-	mainAppLayout := container.NewBorder(shApp.header, shApp.footer, nil, nil, layeredContent)
+	// --- Main Layout ---
+	// Stack background and center content area
+	layeredContent := container.NewStack(shApp.background, shApp.centerContent)
+	// Border layout for the main window structure
+	mainAppLayout := container.NewBorder(header, shApp.footer, nil, nil, layeredContent)
 
 	shApp.window.SetContent(mainAppLayout)
-	shApp.window.SetMaster()
+	shApp.window.SetMaster() // Ensure this is the main window
 
+	// Initial UI state: Show loading indicator immediately
 	shApp.showLoading()
+
+	// --- Asynchronous Data Initialization ---
 	go func() {
-		err := data.InitData()
+		err := data.InitData() // This fetches champion summaries and potentially all skins
 		if err != nil {
 			log.Printf("FATAL: Failed to initialize data: %v", err)
+			// Show error in the UI. Updating UI components from a different goroutine
+			// that are already visible is generally safe in Fyne after initial setup.
 			shApp.showError(fmt.Sprintf("Failed to load required data:\n%v\n\nPlease check connection or restart.", err))
-			return
+
+			// Send notification (optional)
+			fyne.CurrentApp().SendNotification(&fyne.Notification{
+				Title:   "Initialization Error",
+				Content: "Failed to load required application data.",
+			})
+			return // Stop further processing if init fails
 		}
-		shApp.updateStatus("Ready")
-		shApp.showChampionsGrid()
+
+		// Data loaded successfully, switch to the main view (Champions Grid)
+		// Update UI directly from this goroutine is generally safe here.
+		shApp.updateStatus("Ready") // Update internal status
+		shApp.showChampionsGrid()   // Switch to the champion grid view
+
 	}()
 
+	// Start the application event loop
 	shApp.window.ShowAndRun()
 }
 
-func (sh *skinHunterApp) createHeader() fyne.CanvasObject {
-	logoMinSize := fyne.NewSize(180, 30) // Define size once
-	logoRes, err := fyne.LoadResourceFromURLString("https://i.imgur.com/m40l0qA.png")
-	var logo fyne.CanvasObject
-	if err != nil {
-		log.Println("WARN: Failed to load logo:", err)
-		logo = widget.NewLabel("Skin Hunter")
-	} else {
-		logoImg := canvas.NewImageFromResource(logoRes)
-		logoImg.FillMode = canvas.ImageFillContain
-		logoImg.SetMinSize(logoMinSize)
-		logo = logoImg
-	}
+// createHeaderContainer: Sets up the static structure of the header (background, border).
+func (sh *skinHunterApp) createHeaderContainer(content *fyne.Container) fyne.CanvasObject {
+	// Use theme colors for adaptability
+	headerBackground := theme.BackgroundColor()
+	borderColor := theme.ShadowColor() // Or theme.SeparatorColor()
 
-	sh.statusLabel = widget.NewLabel("Loading...")
-	sh.statusLabel.Alignment = fyne.TextAlignCenter
-	statusBg := canvas.NewRectangle(color.NRGBA{R: 0x33, G: 0x33, B: 0x36, A: 0x90})
-	paddedStatusLabel := container.NewPadded(sh.statusLabel)
-	statusBox := container.NewStack(statusBg, paddedStatusLabel)
-
-	headerContent := container.NewHBox(
-		container.NewPadded(logo), // Padded logo on the left
-		layout.NewSpacer(),        // Pushes status to center/right
-		statusBox,                 // Status box takes its preferred size
-		layout.NewSpacer(),        // Pushes any potential right elements away
-	)
-
-	headerBackground := canvas.NewRectangle(color.NRGBA{R: 0x0f, G: 0x17, B: 0x29, A: 0xff})
-	borderColor := color.NRGBA{R: 0x58, G: 0x6a, B: 0x9e, A: 0xff}
+	bgRect := canvas.NewRectangle(headerBackground)
+	// Thin bottom border line
 	bottomBorder := canvas.NewRectangle(borderColor)
-	bottomBorder.SetMinSize(fyne.NewSize(1, 2))
+	bottomBorder.SetMinSize(fyne.NewSize(1, 1)) // Make it 1 pixel high
 
-	headerLayout := container.NewBorder(nil, bottomBorder, nil, nil, headerContent)
-	return container.NewStack(headerBackground, headerLayout)
+	// Add padding around the actual header content (HBox)
+	paddedContent := container.NewPadded(content)
+	// Place the border below the padded content
+	headerLayout := container.NewBorder(nil, bottomBorder, nil, nil, paddedContent)
+
+	// Stack background and the layout with border
+	return container.NewStack(bgRect, headerLayout)
 }
 
+// updateHeaderContent: Safely updates the items within the header's HBox.
+func (sh *skinHunterApp) updateHeaderContent(elements ...fyne.CanvasObject) {
+	sh.headerMutex.Lock()
+	defer sh.headerMutex.Unlock()
+
+	if sh.headerContent == nil {
+		log.Println("ERROR: updateHeaderContent called but headerContent is nil.")
+		return
+	}
+	sh.headerContent.Objects = elements // Replace objects in the HBox
+	// *** CORRECTION HERE ***
+	sh.headerContent.Refresh() // Refresh the HBox (use 'sh', not 'shApp')
+}
+
+// updateStatus: Updates the internal status label (for logging/debugging).
 func (sh *skinHunterApp) updateStatus(status string) {
 	if sh.statusLabel != nil {
 		sh.statusLabel.SetText(status)
+		log.Printf("App Status: %s", status) // Log status changes
 	}
 }
 
+// createFooter: Creates the bottom navigation bar using tab buttons.
 func (sh *skinHunterApp) createFooter() fyne.CanvasObject {
 	tabs := []struct {
 		label  string
 		icon   fyne.Resource
-		view   string
-		action func()
+		view   string // Target view name for switchView
+		action func() // Custom action (like opening search dialog)
 	}{
-		{"Champions", theme.ListIcon(), "champions_grid", nil},
-		{"Search", theme.SearchIcon(), "", func() { sh.showOmniSearch() }},
-		{"Installed", theme.DownloadIcon(), "installed_view", nil},
-		{"Profile", theme.HomeIcon(), "profile_view", nil},
+		{"Champions", theme.HomeIcon(), "champions_grid", nil},
+		{"Search", theme.SearchIcon(), "", func() { sh.showOmniSearch() }}, // Action-based tab
+		{"Installed", theme.DownloadIcon(), "installed_view", nil},         // Placeholder view
+		{"Profile", theme.AccountIcon(), "profile_view", nil},              // Placeholder view
 	}
-	buttons := []fyne.CanvasObject{}
+
+	buttons := make([]fyne.CanvasObject, len(tabs))
 	for i := range tabs {
-		t := tabs[i]
+		t := tabs[i] // Capture loop variable for closure
 		button := ui.NewTabButton(t.label, t.icon, func() {
 			if t.action != nil {
-				t.action()
+				t.action() // Execute custom action if defined
 			} else if t.view != "" {
 				log.Printf("Tab '%s' tapped, switching to view '%s'", t.label, t.view)
-				sh.switchView(t.view)
+				sh.switchView(t.view) // Switch view otherwise
 			} else {
 				log.Printf("Tab '%s' tapped, no action/view defined.", t.label)
 			}
 		})
-		buttons = append(buttons, button)
+		// Wrap button in Max to allow Grid layout to distribute space
+		buttons[i] = container.NewMax(button)
 	}
-	footerContent := container.NewHBox(
-		layout.NewSpacer(), buttons[0], layout.NewSpacer(), buttons[1], layout.NewSpacer(),
-		buttons[2], layout.NewSpacer(), buttons[3], layout.NewSpacer(),
-	)
-	footerBackground := canvas.NewRectangle(color.NRGBA{R: 0x0f, G: 0x17, B: 0x29, A: 0xff})
-	borderColor := color.NRGBA{R: 0x58, G: 0x6a, B: 0x9e, A: 0xff}
+
+	// Use Grid layout for even distribution
+	footerContent := container.NewGridWithColumns(len(tabs), buttons...)
+
+	// Footer styling (similar to header)
+	footerBackground := theme.BackgroundColor()
+	borderColor := theme.ShadowColor()
+
+	bgRect := canvas.NewRectangle(footerBackground)
+	// Thin top border line
 	topBorder := canvas.NewRectangle(borderColor)
-	topBorder.SetMinSize(fyne.NewSize(1, 2))
-	footerLayout := container.NewBorder(topBorder, nil, nil, nil, footerContent)
-	return container.NewStack(footerBackground, footerLayout)
+	topBorder.SetMinSize(fyne.NewSize(1, 1))
+
+	// Add padding around the footer buttons
+	paddedFooterContent := container.NewPadded(footerContent)
+	// Place border above the padded content
+	footerLayout := container.NewBorder(topBorder, nil, nil, nil, paddedFooterContent)
+
+	// Stack background and layout with border
+	return container.NewStack(bgRect, footerLayout)
 }
 
-func (sh *skinHunterApp) createLeftNav() *fyne.Container {
-	sh.navBackButton = widget.NewButtonWithIcon("", theme.NavigateBackIcon(), func() { sh.goBack() })
-	sh.navBackButton.Hide()
-	sh.navToggleButton = widget.NewButtonWithIcon("", theme.ListIcon(), func() { log.Println("INFO: Champion/Skinline toggle placeholder clicked.") })
-	sh.navToggleButton.Hide()
-	navBox := container.NewVBox(layout.NewSpacer(), sh.navBackButton, sh.navToggleButton, layout.NewSpacer())
-	return container.NewPadded(navBox)
-}
-
-func (sh *skinHunterApp) createRightNav() *fyne.Container {
-	startButton := widget.NewButton("Start", func() {
-		log.Println("INFO: 'Start' button placeholder clicked.")
-		dialog.ShowInformation("Start Game", "Placeholder: Game starting...", sh.window)
-	})
-	navBox := container.NewVBox(layout.NewSpacer(), startButton, layout.NewSpacer())
-	return container.NewPadded(navBox)
-}
-
+// switchView: Handles changing the main content area and updating header.
 func (sh *skinHunterApp) switchView(viewName string) {
+	// Avoid unnecessary reloads if already in the target view (unless it's the base grid)
 	if sh.currentView == viewName && viewName != "champions_grid" {
-		log.Printf("Already in view '%s', no change.", viewName)
+		log.Printf("Already in view '%s', no switch.", viewName)
 		return
 	}
 	log.Printf("Switching view from '%s' to '%s'", sh.currentView, viewName)
-	sh.updateStatus("Loading " + strings.ReplaceAll(viewName, "_", " ") + "...")
+
+	sh.isDetailView = false // Reset detail view flag
 	var newContent fyne.CanvasObject
-	wasDetailView := sh.isDetailView
-	sh.isDetailView = false
+	headerElements := []fyne.CanvasObject{layout.NewSpacer()} // Default: empty header
+
+	// --- Determine Content and Header based on viewName ---
 	switch viewName {
 	case "champions_grid":
-		newContent = ui.NewChampionGrid(func(champ data.ChampionSummary) { sh.showChampionDetail(champ) })
+		sh.navBackButton.Hide() // Hide back button on main grid
+		// Title for champion grid (optional)
+		titleLabel := widget.NewLabelWithStyle("Champions", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+		headerElements = []fyne.CanvasObject{layout.NewSpacer(), titleLabel, layout.NewSpacer()}
+		// Create the grid view (now with lazy loading)
+		newContent = ui.NewChampionGrid(func(champ data.ChampionSummary) {
+			sh.showChampionDetail(champ) // Callback to show detail view
+		})
+
 	case "champion_detail":
 		sh.isDetailView = true
-		newContent = ui.NewChampionView(sh.selectedChampion, func() { sh.goBack() },
-			func(skin data.Skin, allChromas []data.Chroma) { ui.ShowSkinDialog(skin, allChromas, sh.window) },
-		)
-	case "installed_view":
-		newContent = container.NewCenter(widget.NewLabel("Installed Skins (Not Implemented)"))
-	case "profile_view":
-		newContent = container.NewCenter(widget.NewLabel("User Profile (Not Implemented)"))
-	default:
-		log.Printf("Warning: Unknown view name '%s'", viewName)
-		newContent = container.NewCenter(widget.NewLabel(fmt.Sprintf("Error: View '%s' not found", viewName)))
-	}
-	if sh.centerContent != nil {
-		sh.centerContent.Objects = []fyne.CanvasObject{newContent}
-		sh.centerContent.Refresh()
-		sh.currentView = viewName
-		log.Printf("Center content updated to '%s'", viewName)
-	} else {
-		log.Println("ERROR: centerContent is nil during switchView!")
-	}
-	sh.updateLeftNav(sh.isDetailView, wasDetailView)
-	sh.updateStatus(strings.Title(strings.ReplaceAll(viewName, "_", " ")))
-}
-
-func (sh *skinHunterApp) updateLeftNav(isDetail, wasDetail bool) {
-	if sh.navBackButton == nil || sh.navToggleButton == nil {
-		log.Println("WARN: Nav buttons not initialized.")
-		return
-	}
-	if isDetail {
-		sh.navBackButton.Show()
-		sh.navToggleButton.Hide()
-		log.Println("Nav updated: Showing Back, Hiding Toggle")
-	} else {
-		sh.navBackButton.Hide()
-		if sh.currentView == "champions_grid" {
-			sh.navToggleButton.Hide() // Keep hidden until implemented
-			log.Println("Nav updated: Hiding Back, Hiding Toggle (for champions_grid)")
-		} else {
-			sh.navToggleButton.Hide()
-			log.Println("Nav updated: Hiding Back, Hiding Toggle")
+		sh.navBackButton.Show() // Show back button for detail view
+		// Use champion name in header title
+		titleText := "Champion Detail"
+		if sh.selectedChampion.Name != "" {
+			titleText = sh.selectedChampion.Name // Use actual champ name
 		}
+		titleLabel := widget.NewLabelWithStyle(titleText, fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+		// Header: Back button, Spacer, Title, Spacer
+		headerElements = []fyne.CanvasObject{
+			sh.navBackButton,
+			layout.NewSpacer(),
+			titleLabel,
+			layout.NewSpacer(),
+		}
+		// Create the champion detail view (now uses lazy-loading skins grid)
+		newContent = ui.NewChampionView(
+			sh.selectedChampion,
+			sh.window,
+			func(skin data.Skin, allChromas []data.Chroma) {
+				// Callback when a skin is selected in the detail view's grid
+				ui.ShowSkinDialog(skin, allChromas, sh.window)
+			},
+		)
+
+	case "installed_view":
+		sh.navBackButton.Hide()
+		titleLabel := widget.NewLabelWithStyle("Installed", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+		headerElements = []fyne.CanvasObject{layout.NewSpacer(), titleLabel, layout.NewSpacer()}
+		newContent = container.NewCenter(widget.NewLabel("Installed Skins View (Not Implemented)")) // Placeholder
+
+	case "profile_view":
+		sh.navBackButton.Hide()
+		titleLabel := widget.NewLabelWithStyle("Profile", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+		headerElements = []fyne.CanvasObject{layout.NewSpacer(), titleLabel, layout.NewSpacer()}
+		newContent = container.NewCenter(widget.NewLabel("User Profile View (Not Implemented)")) // Placeholder
+
+	default: // Unknown view
+		sh.navBackButton.Hide()
+		log.Printf("Warning: Unknown view name requested: '%s'", viewName)
+		titleLabel := widget.NewLabelWithStyle("Error", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+		headerElements = []fyne.CanvasObject{layout.NewSpacer(), titleLabel, layout.NewSpacer()}
+		newContent = container.NewCenter(widget.NewLabel(fmt.Sprintf("Error: View '%s' not found.", viewName)))
 	}
+
+	// --- Update Center Content ---
+	if sh.centerContent == nil {
+		log.Println("CRITICAL ERROR: centerContent container is nil during switchView!")
+		return // Cannot proceed
+	}
+	sh.centerContent.Objects = []fyne.CanvasObject{newContent} // Replace content
+	sh.centerContent.Refresh()
+	sh.currentView = viewName // Update current view state
+	log.Printf("Center content updated to show '%s'", viewName)
+
+	// --- Update Header Content ---
+	sh.updateHeaderContent(headerElements...) // Update header elements dynamically
 }
 
+// showLoading: Displays a loading indicator in the center content area.
 func (sh *skinHunterApp) showLoading() {
-	sh.updateStatus("Loading...")
+	sh.updateStatus("Loading...") // Update internal status
 	if sh.centerContent != nil {
 		loadingIndicator := widget.NewProgressBarInfinite()
 		loadingLabel := widget.NewLabel("Loading Application Data...")
 		loadingBox := container.NewVBox(loadingLabel, loadingIndicator)
 		sh.centerContent.Objects = []fyne.CanvasObject{container.NewCenter(loadingBox)}
 		sh.centerContent.Refresh()
-		sh.currentView = "loading"
+		sh.currentView = "loading" // Set state
 		log.Println("UI state: Loading")
+		// Set a generic loading header
+		loadingTitle := widget.NewLabelWithStyle("Loading...", fyne.TextAlignCenter, fyne.TextStyle{})
+		sh.updateHeaderContent(layout.NewSpacer(), loadingTitle, layout.NewSpacer())
 	} else {
 		log.Println("ERROR: centerContent is nil during showLoading!")
 	}
-	if sh.navBackButton != nil && sh.navToggleButton != nil {
-		sh.updateLeftNav(false, sh.isDetailView)
-	}
 }
 
+// showError: Displays an error message in the center content area.
 func (sh *skinHunterApp) showError(errMsg string) {
-	sh.updateStatus("Error")
+	sh.updateStatus("Error") // Update internal status
 	if sh.centerContent != nil {
 		errorIcon := widget.NewIcon(theme.ErrorIcon())
 		errorLabel := widget.NewLabelWithStyle(errMsg, fyne.TextAlignCenter, fyne.TextStyle{})
-		errorLabel.Wrapping = fyne.TextWrapWord
-		errorBox := container.NewVBox(container.NewCenter(errorIcon), widget.NewSeparator(), errorLabel)
-		sh.centerContent.Objects = []fyne.CanvasObject{container.NewPadded(container.NewCenter(errorBox))}
+		errorLabel.Wrapping = fyne.TextWrapWord // Wrap long error messages
+		// Center the icon and label vertically
+		errorBox := container.NewVBox(
+			layout.NewSpacer(), // Push down
+			container.NewCenter(errorIcon),
+			widget.NewSeparator(),
+			errorLabel,
+			layout.NewSpacer(), // Push up
+		)
+		// Add padding around the error box
+		paddedError := container.NewPadded(errorBox)
+		sh.centerContent.Objects = []fyne.CanvasObject{paddedError}
 		sh.centerContent.Refresh()
-		sh.currentView = "error"
+		sh.currentView = "error" // Set state
 		log.Println("UI state: Error - ", errMsg)
+		// Update header to show error state
+		errorTitle := widget.NewLabelWithStyle("Error", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+		sh.updateHeaderContent(layout.NewSpacer(), errorTitle, layout.NewSpacer())
 	} else {
 		log.Println("ERROR: centerContent is nil during showError!")
 	}
-	if sh.navBackButton != nil && sh.navToggleButton != nil {
-		sh.updateLeftNav(false, sh.isDetailView)
+}
+
+// showChampionsGrid: Convenience function to switch to the champion grid.
+func (sh *skinHunterApp) showChampionsGrid() {
+	sh.switchView("champions_grid")
+}
+
+// showChampionDetail: Stores selected champion and switches to detail view.
+func (sh *skinHunterApp) showChampionDetail(champ data.ChampionSummary) {
+	log.Printf("Navigating to details for champion: %s (ID: %d)", champ.Name, champ.ID)
+	sh.selectedChampion = champ      // Store the selected champion's summary
+	sh.switchView("champion_detail") // Trigger the view switch
+}
+
+// goBack: Handles the action for the navigation back button.
+func (sh *skinHunterApp) goBack() {
+	log.Printf("Go back requested from view: %s", sh.currentView)
+	// If we are in any view that is not the main grid, go back to the grid
+	if sh.currentView != "champions_grid" {
+		sh.switchView("champions_grid")
+	} else {
+		// If already on the main grid, log it (or potentially exit app)
+		log.Println("Already at base view (Champions Grid), cannot go back further.")
+		// Optional: sh.fyneApp.Quit() // Uncomment if back on main grid should quit
 	}
 }
 
-func (sh *skinHunterApp) showChampionsGrid() { sh.switchView("champions_grid") }
-func (sh *skinHunterApp) showChampionDetail(champ data.ChampionSummary) {
-	log.Printf("Navigating to details for champion: %s (ID: %d)", champ.Name, champ.ID)
-	sh.selectedChampion = champ
-	sh.switchView("champion_detail")
-}
-func (sh *skinHunterApp) goBack() {
-	log.Printf("Go back requested from view: %s", sh.currentView)
-	if sh.isDetailView || sh.currentView != "champions_grid" {
-		sh.switchView("champions_grid")
-	} else {
-		log.Println("Already at base view (Champions Grid), cannot go back further.")
-	}
-}
+// showOmniSearch: Displays a placeholder search dialog.
 func (sh *skinHunterApp) showOmniSearch() {
+	log.Println("OmniSearch tab tapped.")
 	searchInput := widget.NewEntry()
 	searchInput.SetPlaceHolder("Search Champions, Skins...")
-	dialog.ShowCustomConfirm("OmniSearch (WIP)", "Search", "Cancel", container.NewVBox(
-		widget.NewLabel("Search feature is not yet implemented."), searchInput,
-	), func(ok bool) {
-		if ok {
-			log.Printf("Search submitted (WIP): %s", searchInput.Text)
-		}
-	}, sh.window)
+	// Dialog content
+	dialogContent := container.NewVBox(
+		widget.NewLabel("OmniSearch (Work in Progress)"),
+		searchInput,
+		widget.NewLabel("Enter search term and press 'Search'."),
+	)
+	// Show a confirmation dialog for search input
+	dialog.ShowCustomConfirm(
+		"Search",      // Title
+		"Search",      // Confirm button text
+		"Cancel",      // Dismiss button text
+		dialogContent, // Content
+		func(confirmed bool) { // Callback
+			if confirmed {
+				searchText := searchInput.Text
+				log.Printf("Search submitted (WIP): '%s'", searchText)
+				// Placeholder for actual search logic
+				dialog.ShowInformation("Search", fmt.Sprintf("Search for '%s' is not yet implemented.", searchText), sh.window)
+			} else {
+				log.Println("Search cancelled.")
+			}
+		},
+		sh.window, // Parent window
+	)
 }
+
+// --- End of main.go ---

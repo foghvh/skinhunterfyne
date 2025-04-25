@@ -13,22 +13,24 @@ import (
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
 
 // NewChampionView creates the view displaying champion details above their skins grid.
-// Uses container.NewBorder, placing the scrollable grid DIRECTLY in the Center.
+// Uses container.NewBorder, placing the scrollable grid (from NewSkinsGrid) DIRECTLY in the Center.
 func NewChampionView(
 	champion data.ChampionSummary,
 	parentWindow fyne.Window,
 	onSkinSelect func(skin data.Skin, allChromas []data.Chroma),
 ) fyne.CanvasObject {
 
-	log.Printf("Creating champion view V5 (Scroll in Border Center) for: %s (ID: %d)", champion.Name, champion.ID)
-	loading := widget.NewProgressBarInfinite()
+	log.Printf("Creating champion view for: %s (ID: %d)", champion.Name, champion.ID)
+	// Use a Max container to hold the loading indicator or the final content
 	viewContainer := container.NewMax()
+	loading := widget.NewProgressBarInfinite()
 	viewContainer.Add(container.NewCenter(container.NewVBox(widget.NewLabel("Loading Champion Details..."), loading)))
 
 	go func() {
@@ -36,34 +38,48 @@ func NewChampionView(
 		var finalContent fyne.CanvasObject
 
 		if err != nil {
-			// ... (manejo de error idéntico) ...
 			log.Printf("Error fetching details for %s (ID: %d): %v", champion.Name, champion.ID, err)
 			errorLabel := widget.NewLabel(fmt.Sprintf("Error loading details for %s:\n%v", champion.Name, err))
 			errorLabel.Wrapping = fyne.TextWrapWord
 			errorLabel.Alignment = fyne.TextAlignCenter
+			// Center the error message
 			finalContent = container.NewCenter(errorLabel)
 		} else {
 			log.Printf("Details fetched successfully for %s", details.Name)
 
-			// --- Construir Sección Superior (Top) ---
-			// Incluye toda la info del campeón Y el título de "Skins"
+			// --- Build Top Section (Champion Info + Skins Title) ---
 			imgSize := float32(64)
 			imgAreaSize := fyne.NewSize(imgSize, imgSize)
 			var champImageWidget fyne.CanvasObject
-			// ... (código de carga de imagen idéntico) ...
-			imageUrl := data.Asset(details.SquarePortraitPath)
-			imgUri, parseErr := storage.ParseURI(imageUrl)
-			if parseErr != nil || imageUrl == data.GetPlaceholderImageURL() {
-				placeholder := canvas.NewRectangle(theme.InputBorderColor())
-				placeholder.SetMinSize(imgAreaSize)
-				placeholderIcon := widget.NewIcon(theme.BrokenImageIcon())
-				champImageWidget = container.NewStack(placeholder, container.NewCenter(placeholderIcon))
-			} else {
+			// Placeholder logic for champion portrait (can also be lazy-loaded if needed)
+			imageStack := container.NewStack() // Use stack for potential lazy load
+			champImageWidget = imageStack      // Assign stack to the layout first
+
+			placeholderIcon := widget.NewIcon(theme.BrokenImageIcon())
+			placeholderRect := canvas.NewRectangle(theme.InputBorderColor())
+			placeholderRect.SetMinSize(imgAreaSize)
+			imageStack.Add(placeholderRect)
+			imageStack.Add(container.NewCenter(placeholderIcon))
+
+			// Lazy load champ image (optional, but consistent)
+			go func(c data.DetailedChampionData, stack *fyne.Container) {
+				imageUrl := data.Asset(c.SquarePortraitPath) // Use Asset func
+				if imageUrl == data.GetPlaceholderImageURL() {
+					return
+				}
+				imgUri, parseErr := storage.ParseURI(imageUrl)
+				if parseErr != nil {
+					log.Printf("WARN: Failed to parse champ portrait URI %s: %v", imageUrl, parseErr)
+					return
+				}
 				imgWidget := canvas.NewImageFromURI(imgUri)
 				imgWidget.SetMinSize(imgAreaSize)
 				imgWidget.FillMode = canvas.ImageFillContain
-				champImageWidget = imgWidget
-			}
+				if stack != nil {
+					stack.Objects = []fyne.CanvasObject{imgWidget} // Replace placeholder
+					stack.Refresh()
+				}
+			}(*details, imageStack)
 
 			champNameLabel := widget.NewLabelWithStyle(details.Name, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 			champTitleText := ""
@@ -72,20 +88,31 @@ func NewChampionView(
 			}
 			champTitleLabel := widget.NewLabel(champTitleText)
 			champTextInfo := container.NewVBox(champNameLabel, champTitleLabel)
+			// Use padding around text info for better spacing
 			champHeader := container.NewHBox(champImageWidget, container.NewPadded(champTextInfo))
 
+			// Bio section (truncated)
 			bioExcerpt := details.ShortBio
-			const maxBioLen = 180
+			const maxBioLen = 180 // Keep truncation logic
 			if utf8.RuneCountInString(bioExcerpt) > maxBioLen {
-				// ... (lógica de truncar bio) ...
 				count := 0
 				cutoff := 0
+				// Correct rune-based truncation
 				for i := range bioExcerpt {
-					count++
 					if count >= maxBioLen {
+						// Find the end of the previous rune
 						cutoff = i
+						// Try to break at space before cutoff if possible
+						lastSpace := strings.LastIndex(bioExcerpt[:cutoff], " ")
+						if lastSpace > maxBioLen-30 { // Only break at space if it's reasonably close
+							cutoff = lastSpace
+						}
 						break
 					}
+					count++
+				}
+				if cutoff == 0 { // Handle case where loop finishes without hitting limit
+					cutoff = len(bioExcerpt)
 				}
 				bioExcerpt = bioExcerpt[:cutoff] + "..."
 			}
@@ -93,84 +120,94 @@ func NewChampionView(
 			bioLabel.Wrapping = fyne.TextWrapWord
 
 			viewMoreButton := widget.NewButton("View more", func() {
-				// ... (lógica del diálogo sin cambios) ...
 				log.Printf("View more clicked for: %s", details.Name)
 				fullBioLabel := widget.NewLabel(details.ShortBio)
 				fullBioLabel.Wrapping = fyne.TextWrapWord
 				scrollBio := container.NewScroll(fullBioLabel)
+				// Set a reasonable minimum size for the dialog content
 				scrollBio.SetMinSize(fyne.NewSize(450, 350))
 				dialog.ShowCustom(fmt.Sprintf("%s - Biography", details.Name), "Close", scrollBio, parentWindow)
 			})
-			bioAndButton := container.NewVBox(bioLabel, viewMoreButton)
+			// Align button to the right maybe? Or keep below label. Below is simpler.
+			// bioAndButton := container.NewBorder(nil, nil, nil, viewMoreButton, bioLabel) // Alternative layout
+			bioAndButton := container.NewVBox(bioLabel, container.NewHBox(layout.NewSpacer(), viewMoreButton)) // Button below, right-aligned
 
-			// Título de Skins
-			skinsIcon := widget.NewIcon(theme.VisibilityIcon())
-			skinsTitleLabel := widget.NewLabelWithStyle(fmt.Sprintf("%s Skins", details.Name), fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+			// Skins Title Header
+			skinsIcon := widget.NewIcon(theme.ColorPaletteIcon()) // Changed icon
+			skinsTitleLabel := widget.NewLabelWithStyle(fmt.Sprintf("%s Skins", details.Name), fyne.TextAlignLeading, fyne.TextStyle{Bold: true, Italic: true})
 			skinsTitleHeader := container.NewHBox(skinsIcon, skinsTitleLabel)
 
-			// Agrupar toda la sección superior en un VBox
+			// Group top section elements
 			topSectionContent := container.NewVBox(
 				champHeader,
+				widget.NewSeparator(),
 				bioAndButton,
 				widget.NewSeparator(),
-				container.NewPadded(skinsTitleHeader), // Título de skins AHORA es parte de la sección superior
+				container.NewPadded(skinsTitleHeader), // Pad the skins title
 			)
-			// Añadir padding general a la sección superior
+			// Add overall padding to the top section
 			topSection := container.NewPadded(topSectionContent)
 
-			// --- Construir Sección Central (Center) ---
-			// ESTA SECCIÓN ES *SOLAMENTE* LA CUADRÍCULA SCROLLABLE
+			// --- Build Center Section (Scrollable Skins Grid) ---
+			// This now uses the updated NewSkinsGrid which handles lazy loading and padding internally.
 			skinsGrid := NewSkinsGrid(details.Skins, func(skin data.Skin) {
-				// ... (lógica onSkinSelect sin cambios) ...
-				log.Printf("Skin selected in ChampionView V5: %s (ID: %d)", skin.Name, skin.ID)
+				log.Printf("Skin selected in ChampionView: %s (ID: %d)", skin.Name, skin.ID)
+				// Collect all chromas *just* for this specific champion
+				// This logic seems correct, but ensure Chromas have OriginSkinID set properly in data layer
 				allChromasForChamp := make([]data.Chroma, 0)
-				for _, s := range details.Skins {
+				for _, s := range details.Skins { // Iterate only through this champion's skins
 					for _, ch := range s.Chromas {
 						chromaCopy := ch
+						// Ensure OriginSkinID is set (should be done in FetchChampionDetails)
 						if chromaCopy.OriginSkinID == 0 {
 							chromaCopy.OriginSkinID = s.ID
+							// log.Printf("WARN: Corrected missing OriginSkinID for chroma %d in champion view", chromaCopy.ID)
 						}
-						allChromasForChamp = append(allChromasForChamp, chromaCopy)
+						// Only add chromas belonging to *this* champion (redundant check maybe, but safe)
+						if data.GetChampionIDFromSkinID(chromaCopy.OriginSkinID) == details.ID {
+							allChromasForChamp = append(allChromasForChamp, chromaCopy)
+						}
 					}
 				}
-				onSkinSelect(skin, allChromasForChamp)
+				log.Printf("Passing %d chromas relevant to champion %s to skin dialog", len(allChromasForChamp), details.Name)
+				onSkinSelect(skin, allChromasForChamp) // Pass only relevant chromas
 			})
 
-			var centerContent fyne.CanvasObject // Será el grid o un mensaje de error
+			// Check if grid creation returned a valid object
+			var centerContent fyne.CanvasObject
 			if skinsGrid != nil {
-				// ASIGNAR EL RESULTADO DE NewSkinsGrid DIRECTAMENTE
-				centerContent = skinsGrid
+				centerContent = skinsGrid // Assign the scrollable grid directly
 			} else {
+				// This case should be handled inside NewSkinsGrid now, but keep fallback
+				log.Println("WARN: NewSkinsGrid returned nil, showing fallback message.")
 				centerContent = container.NewCenter(widget.NewLabel("No skins grid available."))
 			}
 
-			// --- Ensamblaje Final con Border Layout ---
-			// topSection va arriba.
-			// centerContent (el grid scrollable) va al centro y se expandirá.
+			// --- Final Assembly using Border Layout ---
 			finalContent = container.NewBorder(
-				topSection,    // Top: Info campeón + Título Skins
+				topSection,    // Top: Padded champion info + skins title
 				nil,           // Bottom: nil
 				nil,           // Left: nil
 				nil,           // Right: nil
-				centerContent, // Center: ¡El container.Scroll directamente!
+				centerContent, // Center: The result of NewSkinsGrid (scrollable padded grid)
 			)
 
-			log.Printf("Champion view V5 UI (Scroll in Border Center) built for %s", details.Name)
+			log.Printf("Champion view UI built for %s", details.Name)
 		}
 
-		// --- Actualizar UI de forma segura ---
-		// --- Actualizar el Contenido Principal de Forma Segura ---
-		// Ejecutar en el hilo principal de Fyne para evitar problemas de concurrencia
+		// --- Update UI Safely ---
+		// Ensure the update happens on the main Fyne thread
 		if viewContainer != nil {
-			viewContainer.Objects = []fyne.CanvasObject{finalContent} // Reemplaza el loading
+			viewContainer.Objects = []fyne.CanvasObject{finalContent} // Replace loading indicator
 			viewContainer.Refresh()
-			log.Printf("Champion view V3 updated directly for %s", champion.Name)
+			log.Printf("Champion view container updated for %s", champion.Name)
 		} else {
-			log.Println("ERROR: viewContainer is nil when trying to update champion view V3")
+			log.Println("ERROR: viewContainer is nil when trying to update champion view")
 		}
-		// --- FIN CORRECCIÓN ---
 
-	}() // Fin de la goroutine
+	}() // End of goroutine
 
-	return viewContainer
+	return viewContainer // Return the container holding loading/final content
 }
+
+// --- End of champion_view.go ---
