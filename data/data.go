@@ -773,3 +773,5 @@ func ParseHexColor(s string) (color.NRGBA, error) {
 	// If parsing was successful, return the NRGBA color
 	return color.NRGBA{R: uint8(r), G: uint8(g), B: uint8(b), A: uint8(a)}, nil
 }
+
+// --- End of data.go ---

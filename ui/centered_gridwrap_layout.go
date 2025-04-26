@@ -71,7 +71,9 @@ func (l *CenteredGridWrapLayout) MinSize(objects []fyne.CanvasObject) fyne.Size 
 
 	// Altura mínima es la necesaria si todos los objetos estuvieran en una columna.
 	// Esto le informa al Scroll cuál es la altura total del contenido potencial.
-	rows := len(objects) // Número de filas si hay 1 columna
+	// CORRECTION: Calculate rows based on a reasonable minimum width (e.g., 1 column)
+	// This estimate helps the scroll container.
+	rows := len(objects) // Estimate rows for single column
 	minHeight := float32(rows) * l.CellSize.Height
 
 	return fyne.NewSize(minWidth, minHeight)
@@ -85,3 +87,5 @@ func NewCenteredGridWrap(cellSize fyne.Size, objects ...fyne.CanvasObject) *fyne
 	container.Layout = NewCenteredGridWrapLayout(cellSize)
 	return container
 }
+
+// --- End of centered_gridwrap_layout.go ---
