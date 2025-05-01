@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"image/color"
 	"log"
+	"runtime/debug"
+	"sync"
 
 	"skinhunter/data"
 
@@ -18,6 +20,11 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
+type chromaItemUI struct {
+	widget    fyne.CanvasObject
+	nameLabel *widget.Label
+}
+
 func ShowSkinDialog(skin data.Skin, allChromasForChamp []data.Chroma, parent fyne.Window) {
 	log.Printf("Showing dialog for skin: %s (ID: %d)", skin.Name, skin.ID)
 	if allChromasForChamp == nil {
@@ -28,7 +35,7 @@ func ShowSkinDialog(skin data.Skin, allChromasForChamp []data.Chroma, parent fyn
 	filteredChromas := make([]data.Chroma, 0)
 	for _, ch := range allChromasForChamp {
 		if ch.OriginSkinID == 0 {
-			ch.OriginSkinID = data.GetChampionIDFromSkinID(ch.ID)*1000 + (ch.ID % 1000)
+			ch.OriginSkinID = data.DeriveOriginSkinID(ch.ID)
 		}
 		if ch.OriginSkinID == skin.ID {
 			filteredChromas = append(filteredChromas, ch)
@@ -36,6 +43,13 @@ func ShowSkinDialog(skin data.Skin, allChromasForChamp []data.Chroma, parent fyn
 	}
 	log.Printf("Found %d chromas associated with skin ID %d ('%s')", len(filteredChromas), skin.ID, skin.Name)
 
+	var downloadButton *widget.Button
+	var circlesGrid, imagesGrid *fyne.Container
+	var chromaCircleItems = make(map[int]*chromaItemUI)
+	var chromaImageItems = make(map[int]*chromaItemUI)
+	var uiMutex sync.Mutex
+
+	// --- Izquierda: Imagen y Descripción ---
 	imgMinSize := fyne.NewSize(400, 230)
 	imageStack := container.NewStack()
 	leftImage := imageStack
@@ -44,7 +58,7 @@ func ShowSkinDialog(skin data.Skin, allChromasForChamp []data.Chroma, parent fyn
 	placeholderRect.SetMinSize(imgMinSize)
 	imageStack.Add(placeholderRect)
 	imageStack.Add(container.NewCenter(placeholderIcon))
-	go func(s data.Skin, stack *fyne.Container) { // Load splash
+	go func(s data.Skin, stack *fyne.Container) { /* ... Carga Imagen Splash ... */
 		splashUrl := data.GetSkinSplashURL(s)
 		if splashUrl == data.GetPlaceholderImageURL() {
 			return
@@ -60,7 +74,6 @@ func ShowSkinDialog(skin data.Skin, allChromasForChamp []data.Chroma, parent fyn
 			if stack != nil && stack.Visible() {
 				stack.Objects = []fyne.CanvasObject{splashImage}
 				stack.Refresh()
-				log.Printf("Dialog loaded splash for skin %d", s.ID)
 			}
 		})
 	}(skin, imageStack)
@@ -71,17 +84,21 @@ func ShowSkinDialog(skin data.Skin, allChromasForChamp []data.Chroma, parent fyn
 	}
 	descriptionLabel := widget.NewLabel(desc)
 	descriptionLabel.Wrapping = fyne.TextWrapWord
-	descContainer := container.NewMax(descriptionLabel)
-	descriptionScroll := container.NewScroll(descContainer)
-	descriptionScroll.SetMinSize(fyne.NewSize(300, 100))
-	warningLabel := widget.NewLabel("Note: Skin functionality depends on game compatibility.")
-	warningIcon := widget.NewIcon(theme.WarningIcon())
-	warningBox := container.NewPadded(container.NewHBox(warningIcon, warningLabel))
-	leftPanel := container.NewVBox(leftImage, descriptionScroll, warningBox)
+	descScroll := container.NewScroll(descriptionLabel)
+	descScroll.SetMinSize(fyne.NewSize(350, 350)) // Ancho ajustado, altura mínima
 
-	var downloadButton *widget.Button
-	var circlesGrid, imagesGrid *fyne.Container
-	updateSelectionUI := func(newID int) {
+	// *** Layout Panel Izquierdo (VBox simple) ***
+	leftPanel := container.NewVBox(
+		leftImage,
+		descScroll, // Descripción directamente debajo
+		// Sin warningBox
+	)
+	// Añadir padding general al panel izquierdo
+	paddedLeftPanel := container.NewPadded(leftPanel)
+	// -----------------------------------------
+
+	// --- Derecha: Chromas y Acciones ---
+	updateSelectionUI := func(newID int) { /* ... sin cambios ... */
 		*selectedChromaID = newID
 		if downloadButton != nil {
 			btnTxt := "Download Skin"
@@ -97,41 +114,132 @@ func ShowSkinDialog(skin data.Skin, allChromasForChamp []data.Chroma, parent fyn
 			imagesGrid.Refresh()
 		}
 	}
-	modelViewerURL := parseURL(data.KhadaUrl(skin.ID, 0))
+	modelViewerURL := parseURL(data.KhadaUrl(skin.ID, *selectedChromaID))
 	modelViewerLink := widget.NewHyperlink("View on Model Viewer", modelViewerURL)
-	modelInfoIcon := NewIconButton(theme.InfoIcon(), func() { dialog.ShowInformation("Model Viewer", "...", parent) })
-	modelViewerLinkBox := container.NewHBox(modelViewerLink, layout.NewSpacer(), modelInfoIcon)
-	chromaTitle := widget.NewLabel("Chromas")
-	chromaInfoIcon := NewIconButton(theme.InfoIcon(), func() { dialog.ShowInformation("Chromas", "...", parent) })
-	chromaTitleBox := container.NewHBox(chromaTitle, layout.NewSpacer(), chromaInfoIcon)
-	selectDownloadLabel := widget.NewLabel("Select a variation below:")
+	modelViewerBox := container.NewHBox(modelViewerLink, layout.NewSpacer(), NewIconButton(theme.InfoIcon(), func() { dialog.ShowInformation("Model Viewer", "...", parent) }))
+	chromaTitle := widget.NewLabelWithStyle("Chromas", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	chromaTitleBox := container.NewHBox(chromaTitle, layout.NewSpacer(), NewIconButton(theme.InfoIcon(), func() { dialog.ShowInformation("Chromas", "...", parent) }))
+	// *** Texto simplificado ***
+	selectDownloadLabel := widget.NewLabel("Select variation:")
 	selectDownloadLabel.TextStyle = fyne.TextStyle{Italic: true}
-	selectDownloadLabel.Alignment = fyne.TextAlignCenter
 
 	circlesGrid = container.NewGridWithColumns(4)
-	circlesGrid.Add(createChromaCircleItem("Default", nil, skin.ID, selectedChromaID, updateSelectionUI))
-	for _, chroma := range filteredChromas {
-		circlesGrid.Add(createChromaCircleItem(chroma.Name, chroma.Colors, chroma.ID, selectedChromaID, updateSelectionUI))
-	}
-	circlesTabContent := container.NewScroll(circlesGrid)
 	imagesGrid = container.NewGridWithColumns(4)
-	imagesGrid.Add(createChromaImageItem("Default", data.Chroma{OriginSkinID: skin.ID, ID: skin.ID}, skin.ID, selectedChromaID, updateSelectionUI))
+	defaultCircleUI := createChromaCircleItem("Default", nil, skin.ID, selectedChromaID, updateSelectionUI)
+	defaultImageUI := createChromaImageItem("Default", data.Chroma{ID: skin.ID, OriginSkinID: skin.ID}, skin.ID, selectedChromaID, updateSelectionUI)
+	circlesGrid.Add(defaultCircleUI.widget)
+	imagesGrid.Add(defaultImageUI.widget)
 	for _, chroma := range filteredChromas {
-		imagesGrid.Add(createChromaImageItem(chroma.Name, chroma, chroma.ID, selectedChromaID, updateSelectionUI))
+		chromaCopy := chroma
+		circleUI := createChromaCircleItem("Loading...", chromaCopy.Colors, chromaCopy.ID, selectedChromaID, updateSelectionUI)
+		imageUI := createChromaImageItem("Loading...", chromaCopy, chromaCopy.ID, selectedChromaID, updateSelectionUI)
+		circlesGrid.Add(circleUI.widget)
+		imagesGrid.Add(imageUI.widget)
+		uiMutex.Lock()
+		chromaCircleItems[chromaCopy.ID] = &circleUI
+		chromaImageItems[chromaCopy.ID] = &imageUI
+		uiMutex.Unlock()
 	}
+
+	// *** Altura Scroll Chromas (Ajustada para ~2 filas) ***
+	imgItemHeight := float32(64 + 40 + 20) // Altura item imagen (imagen+label+padding)
+	chromaScrollHeight := imgItemHeight*2 + theme.Padding()*3
+	circlesTabContent := container.NewScroll(circlesGrid)
+	circlesTabContent.SetMinSize(fyne.NewSize(350, chromaScrollHeight))
 	imagesTabContent := container.NewScroll(imagesGrid)
-	chromaTabs := container.NewAppTabs(container.NewTabItemWithIcon("Circles", theme.ColorPaletteIcon(), circlesTabContent), container.NewTabItemWithIcon("Images", theme.DocumentIcon(), imagesTabContent))
+	imagesTabContent.SetMinSize(fyne.NewSize(350, chromaScrollHeight))
+
+	chromaTabs := container.NewAppTabs(container.NewTabItemWithIcon("Colors", theme.ColorPaletteIcon(), circlesTabContent), container.NewTabItemWithIcon("Previews", theme.DocumentIcon(), imagesTabContent))
 	chromaTabs.SetTabLocation(container.TabLocationTop)
 
 	creditsText := "Note: Downloading may require credits (Not Implemented)."
 	creditsInfoLabel := widget.NewLabel(creditsText)
 	creditsBox := container.NewHBox(widget.NewIcon(theme.InfoIcon()), creditsInfoLabel)
-	rightPanel := container.NewVBox(modelViewerLinkBox, widget.NewSeparator(), chromaTitleBox, selectDownloadLabel, chromaTabs, layout.NewSpacer(), creditsBox)
-	rightPanelContainer := container.NewPadded(rightPanel)
-	dialogContentSplit := container.NewHSplit(container.NewPadded(leftPanel), rightPanelContainer)
-	dialogContentSplit.Offset = 0.5
 
-	downloadButton = widget.NewButtonWithIcon("Download Skin", theme.DownloadIcon(), func() { /* ... download logic ... */
+	// *** Layout Panel Derecho (VBox) ***
+	rightPanel := container.NewVBox(
+		container.NewPadded(modelViewerBox),
+		widget.NewSeparator(),
+		container.NewPadded(chromaTitleBox),
+		container.NewPadded(selectDownloadLabel), // Con padding
+		chromaTabs,                               // Tabs con scroll
+		layout.NewSpacer(),                       // Empuja créditos abajo
+		container.NewPadded(creditsBox),
+	)
+	// Añadir padding general al panel derecho
+	paddedRightPanel := container.NewPadded(rightPanel)
+	// -----------------------------------------
+
+	// --- Goroutine para fetch nombres (Sin cambios aquí) ---
+	go func(champID int, skinID int) { /* ... como antes ... */
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("PANIC recovered fetching chroma names: %v\n%s", r, string(debug.Stack()))
+			}
+		}()
+		log.Printf("Fetching rich chroma data for champion %d from Supabase...", champID)
+		richData, err := data.FetchChampionJsonFromSupabase(champID)
+		if err != nil {
+			log.Printf("WARN: Failed to fetch rich chroma data: %v", err)
+			return
+		}
+		chromaNames := make(map[int]string)
+		if skinsData, ok := richData["skins"].([]interface{}); ok { /* ... parseo JSON ... */
+			for _, skinInterface := range skinsData {
+				if skinMap, ok := skinInterface.(map[string]interface{}); ok {
+					currentSkinIDFloat, okID := skinMap["id"].(float64)
+					if !okID {
+						continue
+					}
+					currentSkinID := int(currentSkinIDFloat)
+					if currentSkinID == skinID {
+						if chromasData, ok := skinMap["chromas"].([]interface{}); ok {
+							for _, chromaInterface := range chromasData {
+								if chromaMap, ok := chromaInterface.(map[string]interface{}); ok {
+									chromaIDFloat, okCID := chromaMap["id"].(float64)
+									chromaNameStr, okCName := chromaMap["name"].(string)
+									if okCID && okCName {
+										chromaNames[int(chromaIDFloat)] = chromaNameStr
+									}
+								}
+							}
+						}
+						break
+					}
+				}
+			}
+		}
+		log.Printf("Found %d chroma names from Supabase.", len(chromaNames))
+		fyne.Do(func() {
+			uiMutex.Lock()
+			defer uiMutex.Unlock()
+			for id, name := range chromaNames {
+				if itemUI, ok := chromaCircleItems[id]; ok && itemUI.nameLabel != nil {
+					itemUI.nameLabel.SetText(name)
+				}
+				if itemUI, ok := chromaImageItems[id]; ok && itemUI.nameLabel != nil {
+					itemUI.nameLabel.SetText(name)
+				}
+			}
+			if circlesGrid != nil {
+				circlesGrid.Refresh()
+			}
+			if imagesGrid != nil {
+				imagesGrid.Refresh()
+			}
+		})
+	}(data.GetChampionIDFromSkinID(skin.ID), skin.ID)
+
+	// --- Layout principal del diálogo (HBox) ---
+	// Poner panel izquierdo y derecho uno al lado del otro
+	dialogMainContent := container.NewHSplit(
+		paddedLeftPanel,
+		paddedRightPanel,
+	)
+	dialogMainContent.Offset = 0.5 // Ajusta el punto de división si es necesario (0.0 a 1.0)
+
+	// --- Botones de Acción (Abajo a la derecha) ---
+	downloadButton = widget.NewButtonWithIcon("Download Skin", theme.DownloadIcon(), func() { /* ... descarga ... */
 		if selectedChromaID == nil {
 			return
 		}
@@ -159,21 +267,33 @@ func ShowSkinDialog(skin data.Skin, allChromasForChamp []data.Chroma, parent fyn
 		}
 		dialog.ShowInformation("Download", fmt.Sprintf("Placeholder: Download initiated for %s: %s (ID: %d)", downloadType, downloadName, downloadID), parent)
 	})
-	var customDialog dialog.Dialog
-	closeButton := widget.NewButton("Close", func() {
-		if customDialog != nil {
-			customDialog.Hide()
-		}
-	})
-	actionButtons := container.NewBorder(nil, nil, closeButton, downloadButton)
-	finalDialogContent := container.NewBorder(nil, container.NewPadded(actionButtons), nil, nil, dialogContentSplit)
-	customDialog = dialog.NewCustom(skin.Name, "Dismiss", finalDialogContent, parent)
+	closeButton := widget.NewButton("Close", func() {})
+	// Usa Border para poner los botones abajo a la derecha
+	actionButtons := container.NewBorder(
+		nil,                // top
+		nil,                // bottom (los botones estarán aquí)
+		layout.NewSpacer(), // left spacer
+		container.NewHBox(downloadButton, closeButton), // right (botones juntos)
+		nil, // center (vacío)
+	)
+
+	// --- Diálogo Final ---
+	finalDialogContent := container.NewBorder(
+		nil,                                // Top: Título ya está en el diálogo
+		container.NewPadded(actionButtons), // Bottom: Botones con padding
+		nil,                                // Left
+		nil,                                // Right
+		dialogMainContent,                  // Center: El HSplit
+	)
+
+	customDialog := dialog.NewCustom(skin.Name, "", finalDialogContent, parent)
+	closeButton.OnTapped = customDialog.Hide
 	customDialog.Resize(fyne.NewSize(850, 550))
 	customDialog.Show()
 }
 
-// Helper createChromaCircleItem
-func createChromaCircleItem(name string, hexColors []string, itemID int, selectedID *int, onSelect func(id int)) fyne.CanvasObject { /* ... as before ... */
+// Helper createChromaCircleItem - Ajusta tamaño círculo y placeholder
+func createChromaCircleItem(name string, hexColors []string, itemID int, selectedID *int, onSelect func(id int)) chromaItemUI {
 	const visualSize float32 = 48
 	visualMinSize := fyne.NewSize(visualSize, visualSize)
 	var displayElement fyne.CanvasObject
@@ -194,11 +314,13 @@ func createChromaCircleItem(name string, hexColors []string, itemID int, selecte
 			}
 			gradient := canvas.NewHorizontalGradient(clr1, clr2)
 			gradient.SetMinSize(visualMinSize)
-			displayElement = gradient
+			displayElement = gradient // Gradiente ya tiene tamaño
 		} else {
+			// *** CORRECTION: Forzar tamaño de círculo sólido ***
 			circle := canvas.NewCircle(clr1)
-			circle.Resize(visualMinSize)
-			displayElement = circle
+			bgRect := canvas.NewRectangle(color.Transparent)
+			bgRect.SetMinSize(visualMinSize)
+			displayElement = container.NewStack(bgRect, circle) // Poner círculo sobre rectángulo con tamaño
 		}
 	} else {
 		icon := widget.NewIcon(theme.QuestionIcon())
@@ -206,11 +328,13 @@ func createChromaCircleItem(name string, hexColors []string, itemID int, selecte
 		bg.SetMinSize(visualMinSize)
 		displayElement = container.NewStack(bg, container.NewCenter(icon))
 	}
+
 	selectionIndicator := canvas.NewRectangle(color.Transparent)
 	selectionIndicator.StrokeColor = theme.PrimaryColor()
 	selectionIndicator.StrokeWidth = 2
 	selectionIndicator.Resize(fyne.NewSize(visualSize+4, visualSize+4))
 	indicatorWrapper := NewSelectionIndicatorWrapper(displayElement, selectionIndicator, func() bool { return selectedID != nil && *selectedID == itemID })
+
 	nameLabel := widget.NewLabel(name)
 	nameLabel.Alignment = fyne.TextAlignCenter
 	nameLabel.Truncation = fyne.TextTruncateEllipsis
@@ -221,12 +345,17 @@ func createChromaCircleItem(name string, hexColors []string, itemID int, selecte
 			onSelect(itemID)
 		}
 	})
-	card.SetMinSize(fyne.NewSize(visualSize+20, visualSize+40))
-	return card
+
+	// *** Altura consistente ***
+	imgItemHeight := float32(64 + 40 + 20)
+	circleItemWidth := visualSize + 40
+	card.SetMinSize(fyne.NewSize(circleItemWidth, imgItemHeight))
+
+	return chromaItemUI{widget: card, nameLabel: nameLabel}
 }
 
-// Helper createChromaImageItem
-func createChromaImageItem(name string, chroma data.Chroma, itemID int, selectedID *int, onSelect func(id int)) fyne.CanvasObject { /* ... as before ... uses fyne.Do ... */
+// Helper createChromaImageItem - Ajusta placeholder
+func createChromaImageItem(name string, chroma data.Chroma, itemID int, selectedID *int, onSelect func(id int)) chromaItemUI {
 	const imgSize float32 = 64
 	imgAreaSize := fyne.NewSize(imgSize, imgSize)
 	imageStack := container.NewStack()
@@ -237,7 +366,7 @@ func createChromaImageItem(name string, chroma data.Chroma, itemID int, selected
 	imageStack.Add(placeholderRect)
 	imageStack.Add(container.NewCenter(placeholderIcon))
 	if name != "Default" {
-		go func(ch data.Chroma, stack *fyne.Container) {
+		go func(ch data.Chroma, stack *fyne.Container) { /* ... carga imagen async ... */
 			imageURL := data.GetChromaImageURL(ch)
 			if imageURL == data.GetPlaceholderImageURL() {
 				return
@@ -265,6 +394,7 @@ func createChromaImageItem(name string, chroma data.Chroma, itemID int, selected
 	selectionIndicator.StrokeWidth = 2
 	selectionIndicator.Resize(fyne.NewSize(imgSize+4, imgSize+4))
 	indicatorWrapper := NewSelectionIndicatorWrapper(visualElement, selectionIndicator, func() bool { return selectedID != nil && *selectedID == itemID })
+
 	nameLabel := widget.NewLabel(name)
 	nameLabel.Alignment = fyne.TextAlignCenter
 	nameLabel.Truncation = fyne.TextTruncateEllipsis
@@ -275,11 +405,16 @@ func createChromaImageItem(name string, chroma data.Chroma, itemID int, selected
 			onSelect(itemID)
 		}
 	})
-	card.SetMinSize(fyne.NewSize(imgSize+20, imgSize+40))
-	return card
+
+	// *** Altura consistente ***
+	imgItemHeight := float32(64 + 40 + 20)
+	imgItemWidth := imgSize + 40
+	card.SetMinSize(fyne.NewSize(imgItemWidth, imgItemHeight))
+
+	return chromaItemUI{widget: card, nameLabel: nameLabel}
 }
 
-// SelectionIndicatorWrapper definition remains the same
+// --- SelectionIndicatorWrapper (sin cambios) ---
 type SelectionIndicatorWrapper struct {
 	widget.BaseWidget
 	content    fyne.CanvasObject
